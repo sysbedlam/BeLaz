@@ -1,6 +1,6 @@
 # BeLaz — AmneziaWG VPN Manager for OpenWrt
 
-**BeLaz** is a LuCI web interface for managing [AmneziaWG](https://github.com/amnezia-vpn/amneziawg-openwrt) VPN servers and clients on OpenWrt routers. It supports AWG protocol versions 1.0 and 2.0 with full obfuscation parameter control, multi-server setup, advanced routing, and traffic statistics.
+**BeLaz** is a LuCI web interface for managing [AmneziaWG](https://github.com/amnezia-vpn/amneziawg-openwrt) VPN servers and clients on OpenWrt routers. It supports AWG protocol versions 1.0 and 2.0 with full obfuscation parameter control, multi-server setup, and advanced routing.
 
 ---
 
@@ -20,11 +20,6 @@
 - Enable / disable individual clients without deleting them
 - Per-client traffic stats (RX / TX) with online/offline status badge
 
-### Traffic Statistics
-- Monthly accumulated traffic per client
-- Persistent across tunnel restarts (delta tracking)
-- Collected every 5 minutes via cron
-
 ### Advanced Routing
 - **Cascade** — chain one AWG tunnel through another (e.g. exit via a second VPN)
 - **Load balancing / failover** — multipath routing across multiple tunnels with configurable weights
@@ -39,7 +34,6 @@
 
 ### Health Monitoring
 - Ping-based tunnel health check every 30 seconds
-- Integrates with `mwan3` — marks interfaces online/offline on status change
 - Automatically reapplies routing rules on recovery
 - Health status badges (↑/↓) in the Routing tab
 
@@ -47,7 +41,7 @@
 
 ## Requirements
 
-- OpenWrt 22.03 or newer
+- OpenWrt 24.04+ (tested on 24.04 x86_64)
 - [AmneziaWG kernel module and tools](https://github.com/Slava-Shchipunov/awg-openwrt)
 - LuCI web interface
 - `uhttpd`, `rpcd`
@@ -97,10 +91,9 @@ belaz/
 └── root/
     ├── usr/
     │   ├── bin/
-    │   │   ├── awg-manager-backend                 # Shell backend (servers, clients, stats, routing)
+    │   │   ├── awg-manager-backend                 # Shell backend (servers, clients, routing)
     │   │   ├── awg-routing                         # Routing table management
-    │   │   ├── awg-healthcheck                     # Tunnel health monitor
-    │   │   └── awg-stats-collect                   # Cron stats collector
+    │   │   └── awg-healthcheck                     # Tunnel health monitor
     │   └── share/
     │       ├── luci/menu.d/
     │       │   └── luci-app-awg-manager.json       # LuCI menu entry
@@ -108,7 +101,7 @@ belaz/
     │           └── luci-app-awg-manager.json       # rpcd ACL permissions
     └── etc/
         ├── cron.d/
-        │   └── awg-manager                         # Cron jobs (stats + healthcheck)
+        │   └── awg-manager                         # Cron jobs (healthcheck)
         └── init.d/
             └── awg-manager                         # Init script (routing apply/flush)
 ```
@@ -121,7 +114,6 @@ belaz/
 A shell script that handles all server-side operations called by LuCI via `rpcd/fs.exec`:
 - **Servers**: creates UCI network/firewall entries for each AWG interface
 - **Clients**: generates WireGuard config files, assigns IPs, registers peers via UCI
-- **Stats**: tracks per-peer RX/TX deltas, accumulates monthly totals in JSON
 - **Routing**: reads/writes `routing.json` and delegates apply to `awg-routing`
 - **Address lists**: manages named CIDR lists in `address-lists.json`
 
@@ -135,7 +127,7 @@ Applies Linux policy routing from `routing.json`:
 Runs every 30 seconds (via two cron entries with 30s offset):
 - Pings 8.8.8.8 via each monitored interface
 - Writes status to `healthcheck.json`
-- Notifies `mwan3` on state change, reapplies routing
+- Reapplies routing rules on state change
 
 ---
 
@@ -147,7 +139,6 @@ Runs every 30 seconds (via two cron entries with 30s offset):
 | `/etc/awg-manager/servers/<name>/clients/*.conf` | Client WireGuard configs |
 | `/etc/awg-manager/routing.json` | Routing rules (cascades, balancers, policies) |
 | `/etc/awg-manager/address-lists.json` | Address lists for policy routing |
-| `/etc/awg-manager/stats/<name>.json` | Monthly traffic stats |
 | `/etc/awg-manager/healthcheck.json` | Current tunnel health status |
 | `/etc/awg-manager/tables.json` | Routing table number registry |
 
