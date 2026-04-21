@@ -1,0 +1,6 @@
+#!/bin/sh
+for d in /etc/awg-manager/servers/*/; do
+    [ -d "$d" ] || continue
+    iface=$(basename "$d")
+    /usr/bin/awg-manager-backend accumulate_stats "$iface"
+done

@@ -1,0 +1,633 @@
+#!/bin/sh
+# awg-manager-backend v2.1
+
+AWG_BASE="/etc/awg-manager/servers"
+STATS_DIR="/etc/awg-manager/stats"
+DNS_I1='<r 2><b 0x8580000100010000000004796162730679616e6465780272750000010001c00c000100010000026d000457fa27d1>'
+
+random_int() {
+    local min=$1 max=$2
+    local rand=$(hexdump -n 4 -e '"%u"' /dev/urandom)
+    echo $(( min + rand % (max - min + 1) ))
+}
+
+get_server_ip() {
+    ip route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print $2}' | head -1
+}
+
+# Check if port is already used by another server
+is_port_used() {
+    local port=$1
+    for d in $AWG_BASE/*/; do
+        [ -f "$d/server.conf" ] || continue
+        . "$d/server.conf"
+        [ "$SERVER_PORT" = "$port" ] && return 0
+    done
+    return 1
+}
+
+# Check if subnet is already used by another server
+is_subnet_used() {
+    local subnet=$1
+    for d in $AWG_BASE/*/; do
+        [ -f "$d/server.conf" ] || continue
+        . "$d/server.conf"
+        [ "$SUBNET_BASE" = "$subnet" ] && return 0
+    done
+    return 1
+}
+
+# Generate unique random port
+random_port() {
+    local port
+    local attempts=0
+    while [ $attempts -lt 20 ]; do
+        port=$(random_int 10000 65000)
+        is_port_used "$port" || { echo $port; return; }
+        attempts=$((attempts+1))
+    done
+    echo $port
+}
+
+# Generate unique random subnet
+random_subnet() {
+    local subnet
+    local attempts=0
+    while [ $attempts -lt 20 ]; do
+        local a=$(random_int 16 31)
+        local b=$(random_int 1 254)
+        subnet="172.$a.$b"
+        is_subnet_used "$subnet" || { echo $subnet; return; }
+        attempts=$((attempts+1))
+    done
+    echo $subnet
+}
+
+# ─── LIST SERVERS ───────────────────────────────────────────
+list_servers() {
+    printf '['
+    local first=1
+    for d in $AWG_BASE/*/; do
+        [ -f "$d/server.conf" ] || continue
+        local name=$(basename "$d")
+        . "$d/server.conf"
+        [ $first -eq 1 ] && first=0 || printf ','
+        printf '{"name":"%s","port":"%s","ip":"%s","ext_ip":"%s","version":"%s"}' \
+            "$name" "$SERVER_PORT" "$SERVER_IP" "$SERVER_EXT_IP" "${VERSION:-2}"
+    done
+    printf ']\n'
+}
+
+# ─── GET SERVER ─────────────────────────────────────────────
+get_server() {
+    local name=$1
+    local conf="$AWG_BASE/$name/server.conf"
+    [ -f "$conf" ] || { printf 'null\n'; return; }
+    . "$conf"
+    printf '{"name":"%s","pub_key":"%s","port":"%s","ip":"%s","ext_ip":"%s","subnet":"%s","version":"%s","jc":"%s","jmin":"%s","jmax":"%s","s1":"%s","s2":"%s","s3":"%s","s4":"%s","h1":"%s","h2":"%s","h3":"%s","h4":"%s","i1":"%s"}' \
+        "$name" "$SERVER_PUB_KEY" "$SERVER_PORT" "$SERVER_IP" "$SERVER_EXT_IP" \
+        "$SUBNET_BASE" "${VERSION:-2}" "$JC" "$JMIN" "$JMAX" \
+        "$S1" "$S2" "${S3:-0}" "${S4:-0}" \
+        "$H1" "$H2" "$H3" "$H4" "${I1:-}"
+}
+
+# ─── CREATE SERVER ──────────────────────────────────────────
+create_server() {
+    local IFACE=$1
+    local SUBNET=$2
+    local WITH_FIREWALL=${3:-yes}
+    local CUSTOM_PORT=$4
+    local VERSION=${5:-2}
+    local DNS_MASK=${6:-no}
+
+    [ -z "$IFACE" ] && { echo "Error: no interface name"; exit 1; }
+    echo "$IFACE" | grep -qE '^[a-zA-Z0-9_]+$' || { echo "Error: invalid name"; exit 1; }
+
+    local PRIV_KEY=$(awg genkey)
+    local PUB_KEY=$(echo "$PRIV_KEY" | awg pubkey)
+
+    local JC=$(random_int 3 8)
+    local JMIN=$(random_int 10 50)
+    local JMAX=$(random_int $((JMIN + 10)) 100)
+    local S1=$(random_int 15 100)
+    local S2=$(random_int 15 100)
+
+    if [ "$VERSION" = "2" ]; then
+        local S3=$(random_int 5 30)
+        local S4=$(random_int 5 20)
+        # H1-H4 as ranges, non-overlapping zones
+        local H1_MIN=$(random_int 5 500000000)
+        local H1_MAX=$(random_int $((H1_MIN+1)) 999999999)
+        local H2_MIN=$(random_int 1000000001 1500000000)
+        local H2_MAX=$(random_int $((H2_MIN+1)) 1999999999)
+        local H3_MIN=$(random_int 2000000001 2500000000)
+        local H3_MAX=$(random_int $((H3_MIN+1)) 2999999999)
+        local H4_MIN=$(random_int 3000000001 3500000000)
+        local H4_MAX=$(random_int $((H4_MIN+1)) 4294967290)
+        local H1="${H1_MIN}-${H1_MAX}"
+        local H2="${H2_MIN}-${H2_MAX}"
+        local H3="${H3_MIN}-${H3_MAX}"
+        local H4="${H4_MIN}-${H4_MAX}"
+        local I1=""
+        [ "$DNS_MASK" = "yes" ] && I1="$DNS_I1"
+    else
+        # AWG 1.0 — single values, no ranges
+        local S3=0
+        local S4=0
+        local H1=$(random_int 5 1000000000)
+        local H2=$(random_int 1000000001 2000000000)
+        local H3=$(random_int 2000000001 3000000000)
+        local H4=$(random_int 3000000001 4294967290)
+        local I1=""
+    fi
+
+    # Port — custom or unique random
+    local PORT
+    if [ -n "$CUSTOM_PORT" ] && [ "$CUSTOM_PORT" != "0" ]; then
+        PORT=$CUSTOM_PORT
+    else
+        PORT=$(random_port)
+    fi
+
+    # Subnet — custom or unique random
+    if [ -z "$SUBNET" ]; then
+        SUBNET=$(random_subnet)
+    fi
+    local SERVER_IP="${SUBNET}.1"
+    local EXT_IP=$(get_server_ip)
+
+    # Remove existing
+    uci delete network.$IFACE 2>/dev/null
+    uci commit network
+
+    # Create UCI interface
+    uci set network.$IFACE=interface
+    uci set network.$IFACE.proto='amneziawg'
+    uci set network.$IFACE.private_key="$PRIV_KEY"
+    uci set network.$IFACE.listen_port="$PORT"
+    uci set network.$IFACE.addresses="$SERVER_IP/24"
+    uci set network.$IFACE.awg_jc="$JC"
+    uci set network.$IFACE.awg_jmin="$JMIN"
+    uci set network.$IFACE.awg_jmax="$JMAX"
+    uci set network.$IFACE.awg_s1="$S1"
+    uci set network.$IFACE.awg_s2="$S2"
+    [ "$VERSION" = "2" ] && uci set network.$IFACE.awg_s3="$S3"
+    [ "$VERSION" = "2" ] && uci set network.$IFACE.awg_s4="$S4"
+    uci set network.$IFACE.awg_h1="$H1"
+    uci set network.$IFACE.awg_h2="$H2"
+    uci set network.$IFACE.awg_h3="$H3"
+    uci set network.$IFACE.awg_h4="$H4"
+    [ -n "$I1" ] && uci set network.$IFACE.awg_i1="$I1"
+    uci commit network
+
+    # Firewall
+    if [ "$WITH_FIREWALL" = "yes" ]; then
+        uci add firewall zone > /dev/null
+        uci set firewall.@zone[-1].name="$IFACE"
+        uci set firewall.@zone[-1].network="$IFACE"
+        uci set firewall.@zone[-1].input='ACCEPT'
+        uci set firewall.@zone[-1].output='ACCEPT'
+        uci set firewall.@zone[-1].forward='ACCEPT'
+        uci set firewall.@zone[-1].masq='1'
+        uci add firewall forwarding > /dev/null
+        uci set firewall.@forwarding[-1].src="$IFACE"
+        uci set firewall.@forwarding[-1].dest='wan'
+        uci add firewall rule > /dev/null
+        uci set firewall.@rule[-1].name="Allow-$IFACE"
+        uci set firewall.@rule[-1].src='wan'
+        uci set firewall.@rule[-1].dest_port="$PORT"
+        uci set firewall.@rule[-1].proto='udp'
+        uci set firewall.@rule[-1].target='ACCEPT'
+        uci commit firewall
+    fi
+
+    mkdir -p "$AWG_BASE/$IFACE/clients"
+    cat > "$AWG_BASE/$IFACE/server.conf" << EOF
+SERVER_PUB_KEY=$PUB_KEY
+SERVER_PRIV_KEY=$PRIV_KEY
+SERVER_PORT=$PORT
+SERVER_IP=$SERVER_IP
+SERVER_EXT_IP=$EXT_IP
+SUBNET_BASE=$SUBNET
+VERSION=$VERSION
+JC=$JC
+JMIN=$JMIN
+JMAX=$JMAX
+S1=$S1
+S2=$S2
+S3=$S3
+S4=$S4
+H1=$H1
+H2=$H2
+H3=$H3
+H4=$H4
+I1="$I1"
+WITH_FIREWALL=$WITH_FIREWALL
+EOF
+
+    service network restart > /dev/null 2>&1
+    service firewall restart > /dev/null 2>&1
+    sleep 2
+    ifdown $IFACE > /dev/null 2>&1
+    ifup $IFACE > /dev/null 2>&1
+}
+
+# ─── DELETE SERVER ──────────────────────────────────────────
+delete_server() {
+    local IFACE=$1
+    [ -z "$IFACE" ] && exit 1
+    ifdown $IFACE > /dev/null 2>&1
+    uci delete network.$IFACE 2>/dev/null
+    uci commit network
+    local idx=0
+    while uci get firewall.@zone[$idx] > /dev/null 2>&1; do
+        [ "$(uci get firewall.@zone[$idx].name 2>/dev/null)" = "$IFACE" ] && \
+            uci delete firewall.@zone[$idx] && break
+        idx=$((idx+1))
+    done
+    idx=0
+    while uci get firewall.@rule[$idx] > /dev/null 2>&1; do
+        [ "$(uci get firewall.@rule[$idx].name 2>/dev/null)" = "Allow-$IFACE" ] && \
+            uci delete firewall.@rule[$idx] && break
+        idx=$((idx+1))
+    done
+    uci commit firewall
+    rm -rf "$AWG_BASE/$IFACE"
+    rm -f "$STATS_DIR/$IFACE.json"
+    service network restart > /dev/null 2>&1
+    service firewall restart > /dev/null 2>&1
+}
+
+# ─── ADD CLIENT ─────────────────────────────────────────────
+add_client() {
+    local IFACE=$1
+    local CLIENT_NAME=$2
+    local conf="$AWG_BASE/$IFACE/server.conf"
+    [ -f "$conf" ] || exit 1
+    . "$conf"
+
+    local LEGACY="no"
+    [ "${VERSION:-2}" = "1" ] && LEGACY="yes"
+
+    local CLIENTS_DIR="$AWG_BASE/$IFACE/clients"
+    local CLIENT_PRIV=$(awg genkey)
+    local CLIENT_PUB=$(echo "$CLIENT_PRIV" | awg pubkey)
+    local CLIENT_PSK=$(awg genpsk)
+
+    local i=2 CLIENT_IP=""
+    while [ $i -le 254 ]; do
+        local ip="${SUBNET_BASE}.$i"
+        if ! grep -r "Address = $ip" "$CLIENTS_DIR/" > /dev/null 2>&1; then
+            CLIENT_IP=$ip; break
+        fi
+        i=$((i+1))
+    done
+    [ -z "$CLIENT_IP" ] && exit 1
+
+    if [ "$LEGACY" = "yes" ]; then
+        # AWG 1.0 — single H values, no ranges, no S3/S4/I1-I5
+        local CH1=$(echo "$H1" | cut -d- -f1)
+        local CH2=$(echo "$H2" | cut -d- -f1)
+        local CH3=$(echo "$H3" | cut -d- -f1)
+        local CH4=$(echo "$H4" | cut -d- -f1)
+        cat > "$CLIENTS_DIR/$CLIENT_NAME.conf" << EOF
+[Interface]
+PrivateKey = $CLIENT_PRIV
+Address = $CLIENT_IP/32
+DNS = 1.1.1.1, 8.8.8.8
+Jc = $JC
+Jmin = $JMIN
+Jmax = $JMAX
+S1 = $S1
+S2 = $S2
+H1 = $CH1
+H2 = $CH2
+H3 = $CH3
+H4 = $CH4
+
+[Peer]
+PublicKey = $SERVER_PUB_KEY
+PresharedKey = $CLIENT_PSK
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = $SERVER_EXT_IP:$SERVER_PORT
+PersistentKeepAlive = 25
+EOF
+    else
+        # AWG 2.0 — full config with ranges
+        cat > "$CLIENTS_DIR/$CLIENT_NAME.conf" << EOF
+[Interface]
+PrivateKey = $CLIENT_PRIV
+Address = $CLIENT_IP/32
+DNS = 1.1.1.1, 8.8.8.8
+Jc = $JC
+Jmin = $JMIN
+Jmax = $JMAX
+S1 = $S1
+S2 = $S2
+$([ -n "$S3" ] && [ "$S3" != "0" ] && echo "S3 = $S3")
+$([ -n "$S4" ] && [ "$S4" != "0" ] && echo "S4 = $S4")
+H1 = $H1
+H2 = $H2
+H3 = $H3
+H4 = $H4
+$([ -n "$I1" ] && echo "I1 = $I1")
+
+[Peer]
+PublicKey = $SERVER_PUB_KEY
+PresharedKey = $CLIENT_PSK
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = $SERVER_EXT_IP:$SERVER_PORT
+PersistentKeepAlive = 25
+EOF
+    fi
+
+    local PEER_ID="${IFACE}_peer_$(echo $CLIENT_NAME | tr -cd 'a-zA-Z0-9_')"
+    uci set network.$PEER_ID=amneziawg_$IFACE
+    uci set network.$PEER_ID.public_key="$CLIENT_PUB"
+    uci set network.$PEER_ID.preshared_key="$CLIENT_PSK"
+    uci set network.$PEER_ID.allowed_ips="$CLIENT_IP/32"
+    uci set network.$PEER_ID.description="$CLIENT_NAME"
+    uci commit network
+    ifdown $IFACE > /dev/null 2>&1
+    ifup $IFACE > /dev/null 2>&1
+}
+
+# ─── DELETE CLIENT ──────────────────────────────────────────
+delete_client() {
+    local IFACE=$1 CLIENT_NAME=$2
+    [ -z "$IFACE" ] || [ -z "$CLIENT_NAME" ] && exit 1
+    local PEER_ID="${IFACE}_peer_$(echo $CLIENT_NAME | tr -cd 'a-zA-Z0-9_')"
+    uci delete network.$PEER_ID 2>/dev/null
+    uci commit network
+    rm -f "$AWG_BASE/$IFACE/clients/$CLIENT_NAME.conf"
+    ifdown $IFACE > /dev/null 2>&1
+    ifup $IFACE > /dev/null 2>&1
+}
+
+# ─── LIST CLIENTS ───────────────────────────────────────────
+list_clients() {
+    local IFACE=$1
+    local CLIENTS_DIR="$AWG_BASE/$IFACE/clients"
+    printf '['
+    local first=1
+    for f in "$CLIENTS_DIR"/*.conf; do
+        [ -f "$f" ] || continue
+        local name=$(basename "$f" .conf)
+        local ip=$(grep "^Address" "$f" | awk '{print $3}' | cut -d/ -f1)
+        local peer_id="${IFACE}_peer_$(echo $name | tr -cd 'a-zA-Z0-9_')"
+        local disabled=$(uci get network.$peer_id.disabled 2>/dev/null || echo "0")
+        local legacy="no"
+        grep -q "^H1 = [0-9]*$" "$f" && legacy="yes"
+        [ $first -eq 1 ] && first=0 || printf ','
+        printf '{"name":"%s","ip":"%s","disabled":"%s","legacy":"%s"}' \
+            "$name" "$ip" "$disabled" "$legacy"
+    done
+    printf ']\n'
+}
+
+# ─── PEERS STATS ────────────────────────────────────────────
+peers_stats() {
+    local IFACE=$1
+    local CLIENTS_DIR="$AWG_BASE/$IFACE/clients"
+    local AWG_OUTPUT=$(awg show $IFACE dump 2>/dev/null)
+    printf '{'
+    local first=1
+    for f in "$CLIENTS_DIR"/*.conf; do
+        [ -f "$f" ] || continue
+        local name=$(basename "$f" .conf)
+        local peer_id="${IFACE}_peer_$(echo $name | tr -cd 'a-zA-Z0-9_')"
+        local pub=$(uci get network.$peer_id.public_key 2>/dev/null)
+        [ -z "$pub" ] && continue
+        local line=$(echo "$AWG_OUTPUT" | grep "^$pub	")
+        local last_hs=0 rx=0 tx=0
+        if [ -n "$line" ]; then
+            last_hs=$(echo "$line" | awk '{print $5}')
+            rx=$(echo "$line" | awk '{print $6}')
+            tx=$(echo "$line" | awk '{print $7}')
+        fi
+        [ $first -eq 1 ] && first=0 || printf ','
+        printf '"%s":{"last_handshake":"%s","rx":"%s","tx":"%s"}' \
+            "$name" "$last_hs" "$rx" "$tx"
+    done
+    printf '}\n'
+}
+
+# ─── ACCUMULATE STATS ───────────────────────────────────────
+accumulate_stats() {
+    local IFACE=$1
+    [ -z "$IFACE" ] && exit 1
+    mkdir -p "$STATS_DIR"
+    local STATS_FILE="$STATS_DIR/$IFACE.json"
+    local CLIENTS_DIR="$AWG_BASE/$IFACE/clients"
+    local AWG_OUTPUT=$(awg show $IFACE dump 2>/dev/null)
+    local NOW=$(date +%s)
+    local MONTH=$(date +%Y-%m)
+
+    printf '{' > /tmp/awg_stats_new.json
+    local first=1
+    for f in "$CLIENTS_DIR"/*.conf; do
+        [ -f "$f" ] || continue
+        local name=$(basename "$f" .conf)
+        local peer_id="${IFACE}_peer_$(echo $name | tr -cd 'a-zA-Z0-9_')"
+        local pub=$(uci get network.$peer_id.public_key 2>/dev/null)
+        [ -z "$pub" ] && continue
+        local line=$(echo "$AWG_OUTPUT" | grep "^$pub	")
+        local cur_rx=0 cur_tx=0
+        [ -n "$line" ] && \
+            cur_rx=$(echo "$line" | awk '{print $6}') && \
+            cur_tx=$(echo "$line" | awk '{print $7}')
+
+        # Read previous snapshot and accumulated
+        local prev_rx=0 prev_tx=0 acc_rx=0 acc_tx=0 acc_month=""
+        if [ -f "$STATS_FILE" ]; then
+            local entry=$(grep -o "\"$name\":{[^}]*}" "$STATS_FILE" 2>/dev/null)
+            prev_rx=$(echo "$entry" | grep -o '"prev_rx":"[0-9]*"' | grep -o '[0-9]*')
+            prev_tx=$(echo "$entry" | grep -o '"prev_tx":"[0-9]*"' | grep -o '[0-9]*')
+            acc_rx=$(echo "$entry" | grep -o '"acc_rx":"[0-9]*"' | grep -o '[0-9]*')
+            acc_tx=$(echo "$entry" | grep -o '"acc_tx":"[0-9]*"' | grep -o '[0-9]*')
+            acc_month=$(echo "$entry" | grep -o '"month":"[^"]*"' | grep -o '[0-9-]*')
+        fi
+        [ -z "$prev_rx" ] && prev_rx=0
+        [ -z "$prev_tx" ] && prev_tx=0
+        [ -z "$acc_rx" ] && acc_rx=0
+        [ -z "$acc_tx" ] && acc_tx=0
+
+        # Reset on new month
+        [ "$acc_month" != "$MONTH" ] && acc_rx=0 && acc_tx=0
+
+        # Calculate delta (handle session resets)
+        local delta_rx=0 delta_tx=0
+        if [ "$cur_rx" -ge "$prev_rx" ] 2>/dev/null; then
+            delta_rx=$((cur_rx - prev_rx))
+        else
+            delta_rx=$cur_rx
+        fi
+        if [ "$cur_tx" -ge "$prev_tx" ] 2>/dev/null; then
+            delta_tx=$((cur_tx - prev_tx))
+        else
+            delta_tx=$cur_tx
+        fi
+
+        acc_rx=$((acc_rx + delta_rx))
+        acc_tx=$((acc_tx + delta_tx))
+
+        [ $first -eq 1 ] && first=0 || printf ',' >> /tmp/awg_stats_new.json
+        printf '"%s":{"acc_rx":"%s","acc_tx":"%s","prev_rx":"%s","prev_tx":"%s","month":"%s","updated":"%s"}' \
+            "$name" "$acc_rx" "$acc_tx" "$cur_rx" "$cur_tx" "$MONTH" "$NOW" \
+            >> /tmp/awg_stats_new.json
+    done
+    printf '}' >> /tmp/awg_stats_new.json
+    mv /tmp/awg_stats_new.json "$STATS_FILE"
+}
+
+# ─── MONTHLY STATS ──────────────────────────────────────────
+monthly_stats() {
+    local IFACE=$1
+    local STATS_FILE="$STATS_DIR/$IFACE.json"
+    [ -f "$STATS_FILE" ] && cat "$STATS_FILE" || printf '{}\n'
+}
+
+# ─── ADDRESS LISTS ──────────────────────────────────────────
+LISTS_FILE="/etc/awg-manager/address-lists.json"
+
+init_lists() {
+    [ -f "$LISTS_FILE" ] || echo '[]' > "$LISTS_FILE"
+}
+
+get_lists() {
+    init_lists
+    cat "$LISTS_FILE"
+}
+
+save_list() {
+    local name=$1
+    local cidrs_raw=$2
+    init_lists
+    mkdir -p /etc/awg-manager
+
+    # Build cidrs JSON array — normalize IPs without prefix to /32
+    local arr="["
+    local first=1
+    echo "$cidrs_raw" | tr ',' '\n' | tr ' ' '\n' > /tmp/awg_cidrs.tmp
+    while read cidr; do
+        cidr=$(echo "$cidr" | tr -d ' \r\t')
+        [ -z "$cidr" ] && continue
+        # Add /32 if no prefix
+        echo "$cidr" | grep -q '/' || cidr="${cidr}/32"
+        [ $first -eq 1 ] && first=0 || arr="${arr},"
+        arr="${arr}\"${cidr}\""
+    done < /tmp/awg_cidrs.tmp
+    rm -f /tmp/awg_cidrs.tmp
+    arr="${arr}]"
+
+    # Rebuild lists file without this entry then add new
+    local existing=$(cat "$LISTS_FILE")
+    printf '[' > "$LISTS_FILE"
+    local f=1
+    echo "$existing" | grep -o '"name":"[^"]*","cidrs":\[[^]]*\]' | while read entry; do
+        local ename=$(echo "$entry" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+        [ "$ename" = "$name" ] && continue
+        [ $f -eq 1 ] && f=0 || printf ','
+        printf '{%s}' "$entry"
+    done >> "$LISTS_FILE"
+    # Check if we wrote anything
+    local content=$(cat "$LISTS_FILE")
+    [ "$content" = "[" ] && printf '{"name":"%s","cidrs":%s}' "$name" "$arr" >> "$LISTS_FILE" \
+                         || printf ',{"name":"%s","cidrs":%s}' "$name" "$arr" >> "$LISTS_FILE"
+    printf ']' >> "$LISTS_FILE"
+}
+
+delete_list() {
+    local name=$1
+    init_lists
+    local existing=$(cat "$LISTS_FILE")
+    printf '[' > "$LISTS_FILE"
+    local f=1
+    echo "$existing" | grep -o '"name":"[^"]*","cidrs":\[[^]]*\]' | while read entry; do
+        local ename=$(echo "$entry" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+        [ "$ename" = "$name" ] && continue
+        [ $f -eq 1 ] && f=0 || printf ','
+        printf '{%s}' "$entry"
+    done >> "$LISTS_FILE"
+    printf ']' >> "$LISTS_FILE"
+}
+
+# ─── ROUTING ────────────────────────────────────────────────
+ROUTING_FILE="/etc/awg-manager/routing.json"
+
+init_routing() {
+    [ -f "$ROUTING_FILE" ] || echo '{"cascades":[],"balancers":[],"rules":[]}' > "$ROUTING_FILE"
+}
+
+get_routing() {
+    init_routing
+    cat "$ROUTING_FILE"
+}
+
+get_healthcheck() {
+    [ -f "/etc/awg-manager/healthcheck.json" ] && \
+        cat "/etc/awg-manager/healthcheck.json" || echo '{}'
+}
+
+get_interfaces() {
+    printf '['
+    local first=1
+    local listed=""
+    # AWG servers first
+    for d in $AWG_BASE/*/; do
+        [ -f "$d/server.conf" ] || continue
+        local name=$(basename "$d")
+        listed="$listed $name"
+        [ $first -eq 1 ] && first=0 || printf ','
+        printf '{"name":"%s","type":"awg"}' "$name"
+    done
+    # System interfaces — skip lo and already listed AWG ones
+    for iface in $(ip link show | grep -oE '^[0-9]+: [a-zA-Z0-9_@]+' | awk '{print $2}' | tr -d '@' | grep -v '^lo$'); do
+        echo "$listed" | grep -qw "$iface" && continue
+        [ $first -eq 1 ] && first=0 || printf ','
+        printf '{"name":"%s","type":"system"}' "$iface"
+    done
+    printf ']\n'
+}
+
+save_routing() {
+    local json=$1
+    echo "$json" > "$ROUTING_FILE"
+    /usr/bin/awg-routing apply
+}
+
+# ─── DISPATCH ───────────────────────────────────────────────
+case $1 in
+    list_servers)     list_servers ;;
+    get_server)       get_server "$2" ;;
+    create_server)    create_server "$2" "$3" "$4" "$5" "$6" "$7" ;;
+    delete_server)    delete_server "$2" ;;
+    list_clients)     list_clients "$2" ;;
+    add_client)       add_client "$2" "$3" "$4" ;;
+    delete_client)    delete_client "$2" "$3" ;;
+    peers_stats)      peers_stats "$2" ;;
+    accumulate_stats) accumulate_stats "$2" ;;
+    monthly_stats)    monthly_stats "$2" ;;
+    enable_client)
+        PEER_ID="${2}_peer_$(echo $3 | tr -cd 'a-zA-Z0-9_')"
+        uci delete network.$PEER_ID.disabled 2>/dev/null
+        uci commit network
+        ifdown $2 > /dev/null 2>&1
+        ifup $2 > /dev/null 2>&1
+        ;;
+    disable_client)
+        PEER_ID="${2}_peer_$(echo $3 | tr -cd 'a-zA-Z0-9_')"
+        uci set network.$PEER_ID.disabled='1'
+        uci commit network
+        ifdown $2 > /dev/null 2>&1
+        ifup $2 > /dev/null 2>&1
+        ;;
+    get_routing)      get_routing ;;
+    save_routing)     save_routing "$2" ;;
+    get_healthcheck)  get_healthcheck ;;
+    get_interfaces)   get_interfaces ;;
+    get_lists)        get_lists ;;
+    save_list)        save_list "$2" "$3" ;;
+    delete_list)      delete_list "$2" ;;
+    *) echo "Usage: $0 <command> [args]" ;;
+esac

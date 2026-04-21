@@ -1,0 +1,25 @@
+{
+	"luci-app-awg-manager": {
+		"description": "Grant access to AmneziaWG Manager",
+		"read": {
+			"file": {
+				"/etc/awg-manager": [ "list" ],
+				"/etc/awg-manager/*": [ "read" ],
+				"/etc/awg-manager/servers": [ "list" ],
+				"/etc/awg-manager/servers/*": [ "read", "list" ],
+				"/etc/awg-manager/servers/*/*": [ "read", "list" ],
+				"/etc/awg-manager/servers/*/clients/*": [ "read" ],
+				"/etc/awg-manager/stats/*": [ "read" ],
+				"/usr/bin/awg-manager-backend": [ "exec" ],
+				"/usr/bin/awg-manager-backend *": [ "exec" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/etc/awg-manager/servers/*/clients/*": [ "write" ],
+				"/usr/bin/awg-manager-backend": [ "exec" ],
+				"/usr/bin/awg-manager-backend *": [ "exec" ]
+			}
+		}
+	}
+}

@@ -1,0 +1,258 @@
+#!/bin/sh
+# awg-routing v2.4
+
+ROUTING_FILE="/etc/awg-manager/routing.json"
+LISTS_FILE="/etc/awg-manager/address-lists.json"
+TABLES_FILE="/etc/awg-manager/tables.json"
+PRIO_POLICY=100    # policy rules: 100-199 — applied FIRST
+PRIO_CASCADE=200   # cascade rules: 200-201 — applied after policy
+TABLE_BASE=100     # routing tables: 100-149
+
+log() { logger -t awg-routing "$1"; }
+
+# ─── Table registry ──────────────────────────────────────────
+# Get or assign table number for exit node
+get_table() {
+    local exit_node=$1
+    mkdir -p /etc/awg-manager
+    [ -f "$TABLES_FILE" ] || echo '{}' > "$TABLES_FILE"
+    local existing=$(grep -o "\"$exit_node\":[0-9]*" "$TABLES_FILE" | cut -d: -f2)
+    if [ -n "$existing" ]; then
+        echo $existing
+        return
+    fi
+    # Find next free table
+    local t=$TABLE_BASE
+    while [ $t -le 149 ]; do
+        echo "$( cat $TABLES_FILE )" | grep -q ":$t[,}]" || { echo $t; return; }
+        t=$((t+1))
+    done
+    echo $TABLE_BASE  # fallback
+}
+
+register_table() {
+    local exit_node=$1 table=$2
+    [ -f "$TABLES_FILE" ] || echo '{}' > "$TABLES_FILE"
+    # Simple JSON update without jq
+    local json=$(cat "$TABLES_FILE")
+    if echo "$json" | grep -q "\"$exit_node\""; then
+        # Already exists
+        return
+    fi
+    # Add entry
+    local new=$(echo "$json" | sed "s/}$/,\"$exit_node\":$table}/;s/^{,/{/")
+    echo "$new" > "$TABLES_FILE"
+}
+
+reset_tables() {
+    echo '{}' > "$TABLES_FILE"
+}
+
+# ─── Get CIDRs from address list ─────────────────────────────
+get_list_cidrs() {
+    local list_name=$1
+    [ -f "$LISTS_FILE" ] || return
+    # Extract cidrs array for this list
+    grep -o "\"name\":\"$list_name\"[^}]*}" "$LISTS_FILE" | \
+        grep -o '"cidrs":\[[^]]*\]' | \
+        grep -o '"[0-9./]*"' | tr -d '"'
+}
+
+# ─── Flush all our rules and tables ──────────────────────────
+flush_routing() {
+    for prio in $(ip rule show | awk -F: '{print $1}' | tr -d ' ' | awk '$1>=100 && $1<=299'); do
+        ip rule del prio $prio 2>/dev/null
+    done
+    for i in $(seq 100 149); do
+        ip route flush table $i 2>/dev/null
+    done
+    reset_tables
+    log "Flushed all routing rules"
+}
+
+# ─── Setup routing table for exit node ───────────────────────
+setup_table() {
+    local exit_node=$1
+    local table=$(get_table "$exit_node")
+    register_table "$exit_node" "$table"
+    ip route flush table $table 2>/dev/null
+    ip route add default dev $exit_node table $table 2>/dev/null || \
+        ip route add default via $(ip route show dev $exit_node | grep default | awk '{print $3}' | head -1) table $table 2>/dev/null
+    echo $table
+}
+
+# ─── Apply cascade ───────────────────────────────────────────
+apply_cascade() {
+    local from=$1 to=$2
+    local table=$(setup_table "$to")
+
+    # Unique prio per server: hash of interface name, offset from 200
+    local hash=0
+    local i=1 len=${#from}
+    while [ $i -le $len ]; do
+        hash=$((hash + $(printf '%d' "'$(echo "$from" | cut -c$i)")))
+        i=$((i+1))
+    done
+    local prio=$((PRIO_CASCADE + hash % 90))
+
+    log "Cascade: $from -> $to (table=$table prio=$prio)"
+
+    local from_net=$(ip addr show $from 2>/dev/null | grep 'inet ' | awk '{print $2}' | head -1)
+    [ -n "$from_net" ] && ip rule add from $from_net lookup $table prio $prio 2>/dev/null
+    ip rule add iif $from lookup $table prio $((prio+1)) 2>/dev/null
+}
+
+# ─── Apply policy rule ───────────────────────────────────────
+apply_policy() {
+    local from=$1 list_name=$2 action=$3 exit_node=$4
+    local prio=$PRIO_POLICY
+
+    # Find base prio for this rule (unique per from+list combo)
+    local hash=0
+    local i=1 len=${#from}
+    while [ $i -le $len ]; do
+        hash=$((hash + $(printf '%d' "'$(echo "$from" | cut -c$i)")))
+        i=$((i+1))
+    done
+    prio=$((PRIO_POLICY + hash % 90))
+
+    log "Policy: from=$from list=$list_name action=$action exit=$exit_node prio=$prio"
+
+    local table=""
+    if [ "$action" = "exit" ] && [ -n "$exit_node" ]; then
+        table=$(setup_table "$exit_node")
+    fi
+
+    local cidrs=$(get_list_cidrs "$list_name")
+    [ -z "$cidrs" ] && log "Warning: list $list_name is empty" && return
+
+    for cidr in $cidrs; do
+        if [ "$action" = "block" ]; then
+            ip rule add iif $from to $cidr blackhole prio $prio 2>/dev/null
+        else
+            ip rule add iif $from to $cidr lookup $table prio $prio 2>/dev/null
+        fi
+        prio=$((prio+1))
+    done
+}
+
+# ─── Apply balancer (multipath) ──────────────────────────────
+apply_balancer() {
+    local from=$1
+    local nodes_json=$2
+    local mode=${3:-balance}
+
+    local reg_key="bal_${from}"
+    local table=$(get_table "$reg_key")
+    register_table "$reg_key" "$table"
+
+    local hash=0
+    local i=1 len=${#from}
+    while [ $i -le $len ]; do
+        hash=$((hash + $(printf '%d' "'$(echo "$from" | cut -c$i)")))
+        i=$((i+1))
+    done
+    local prio=$((PRIO_CASCADE + 50 + hash % 40))
+
+    log "Balancer: from=$from mode=$mode table=$table prio=$prio"
+
+    ip route flush table $table 2>/dev/null
+
+    # Parse nodes, filter by health status
+    echo "$nodes_json" | tr '}' '\n' | grep '"iface"' > /tmp/awg_bal.tmp
+
+    local route_args=""
+    local first_alive=""
+    local any_node=""
+
+    while read node; do
+        local iface=$(echo "$node" | grep -o '"iface":"[^"]*"' | cut -d'"' -f4)
+        local weight=$(echo "$node" | grep -o '"weight":[0-9]*' | cut -d: -f2)
+        [ -z "$iface" ] && continue
+        weight=${weight:-1}
+        any_node="$iface"
+
+        # Check health status
+        local status="unknown"
+        [ -f "/etc/awg-manager/healthcheck.json" ] && \
+            status=$(grep -o "\"$iface\":\"[^\"]*\"" /etc/awg-manager/healthcheck.json | cut -d'"' -f4)
+
+        # Skip dead nodes (but only if we have health data)
+        [ "$status" = "down" ] && log "Balancer: skipping dead node $iface" && continue
+
+        if [ "$mode" = "failover" ]; then
+            # Failover — use only first alive node
+            [ -z "$first_alive" ] && first_alive="$iface" && \
+                route_args="nexthop dev $iface weight 1"
+        else
+            # Balance — add all alive nodes
+            route_args="$route_args nexthop dev $iface weight $weight"
+        fi
+    done < /tmp/awg_bal.tmp
+    rm -f /tmp/awg_bal.tmp
+
+    # If all nodes dead — use any node as fallback
+    [ -z "$route_args" ] && [ -n "$any_node" ] && \
+        route_args="nexthop dev $any_node weight 1" && \
+        log "Balancer: all nodes dead, using $any_node as fallback"
+
+    [ -z "$route_args" ] && log "Balancer: no nodes for $from" && return
+
+    ip route add default table $table $route_args 2>/dev/null || \
+        log "Balancer: failed to add route for $from"
+
+    local from_net=$(ip addr show $from 2>/dev/null | grep 'inet ' | awk '{print $2}' | head -1)
+    [ -n "$from_net" ] && ip rule add from $from_net lookup $table prio $prio 2>/dev/null
+    ip rule add iif $from lookup $table prio $((prio+1)) 2>/dev/null
+
+    log "Balancer applied: $from -> $route_args"
+}
+
+# ─── Apply all from routing.json ─────────────────────────────
+apply_all() {
+    [ -f "$ROUTING_FILE" ] || { log "No routing.json"; exit 0; }
+    flush_routing
+
+    # Apply cascades
+    grep -o '"cascades":\[[^]]*\]' "$ROUTING_FILE" | grep -o '{[^}]*}' > /tmp/awg_c.tmp
+    while read entry; do
+        local from=$(echo "$entry" | grep -o '"from":"[^"]*"' | cut -d'"' -f4)
+        local to=$(echo "$entry" | grep -o '"to":"[^"]*"' | cut -d'"' -f4)
+        [ -n "$from" ] && [ -n "$to" ] && apply_cascade "$from" "$to"
+    done < /tmp/awg_c.tmp
+    rm -f /tmp/awg_c.tmp
+
+    # Apply balancers (multipath)
+    local bal_json=$(cat "$ROUTING_FILE")
+    # Extract each balancer by finding "from" fields in balancers section
+    local bal_section=$(echo "$bal_json" | grep -o '"balancers":\[.*\],"rules"' | sed 's/,"rules"//')
+    # Parse from fields
+    echo "$bal_section" | grep -o '"from":"[^"]*"' | cut -d'"' -f4 > /tmp/awg_bal_froms.tmp
+    while read from; do
+        [ -z "$from" ] && continue
+        local nodes=$(echo "$bal_section" | grep -o "\"from\":\"$from\"[^]]*\"nodes\":\[[^]]*\]" | grep -o '"nodes":\[[^]]*\]' | sed 's/"nodes"://')
+        local mode=$(echo "$bal_section" | grep -o "\"from\":\"$from\",[^{]*" | grep -o '"mode":"[^"]*"' | cut -d'"' -f4)
+        mode=${mode:-balance}
+        [ -n "$from" ] && [ -n "$nodes" ] && apply_balancer "$from" "$nodes" "$mode"
+    done < /tmp/awg_bal_froms.tmp
+    rm -f /tmp/awg_bal_froms.tmp
+
+    # Apply policy rules
+    grep -o '"rules":\[[^]]*\]' "$ROUTING_FILE" | grep -o '{[^}]*}' > /tmp/awg_r.tmp
+    while read entry; do
+        local from=$(echo "$entry" | grep -o '"from":"[^"]*"' | cut -d'"' -f4)
+        local list=$(echo "$entry" | grep -o '"list":"[^"]*"' | cut -d'"' -f4)
+        local action=$(echo "$entry" | grep -o '"action":"[^"]*"' | cut -d'"' -f4)
+        local exit=$(echo "$entry" | grep -o '"exit":"[^"]*"' | cut -d'"' -f4)
+        [ -n "$from" ] && [ -n "$list" ] && apply_policy "$from" "$list" "$action" "$exit"
+    done < /tmp/awg_r.tmp
+    rm -f /tmp/awg_r.tmp
+
+    log "All routing applied"
+}
+
+case ${1:-apply} in
+    apply) apply_all ;;
+    flush) flush_routing ;;
+    *) echo "Usage: $0 [apply|flush]" ;;
+esac

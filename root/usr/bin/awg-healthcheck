@@ -1,0 +1,58 @@
+#!/bin/sh
+# awg-healthcheck v2.5 - Check AWG tunnels via handshake, notify mwan3
+
+ROUTING_FILE="/etc/awg-manager/routing.json"
+STATUS_FILE="/etc/awg-manager/healthcheck.json"
+HANDSHAKE_TIMEOUT=180  # 3 min
+
+log() { logger -t awg-healthcheck "$1"; }
+
+check_iface() {
+    local iface=$1
+    ping -I "$iface" -c 2 -W 3 8.8.8.8 > /dev/null 2>&1 && echo "up" || echo "down"
+}
+
+get_all_nodes() {
+    [ -f "$ROUTING_FILE" ] || return
+    local json=$(cat "$ROUTING_FILE")
+    # Cascade exit nodes
+    echo "$json" | grep -oE '"to":"[^"]*"' | cut -d'"' -f4
+    # Policy rule exit nodes
+    echo "$json" | grep -oE '"exit":"[^"]*"' | cut -d'"' -f4
+    # Balancer nodes
+    echo "$json" | grep -oE '"iface":"[^"]*"' | cut -d'"' -f4
+}
+
+run_healthcheck() {
+    local mwan3_ok=0
+    which mwan3 > /dev/null 2>&1 && mwan3_ok=1
+
+    printf '{' > /tmp/awg_health_new.json
+    local first=1
+
+    for node in $(get_all_nodes | sort -u); do
+        [ -z "$node" ] && continue
+        local status=$(check_iface "$node")
+        local prev=""
+        [ -f "$STATUS_FILE" ] && prev=$(grep -o "\"$node\":\"[^\"]*\"" "$STATUS_FILE" | cut -d'"' -f4)
+
+        # Notify mwan3 if status changed
+        if [ "$status" != "$prev" ] && [ $mwan3_ok -eq 1 ]; then
+            log "Node $node: $prev -> $status"
+            if [ "$status" = "up" ]; then
+                mwan3 use interface "$node" online 2>/dev/null
+            else
+                mwan3 use interface "$node" offline 2>/dev/null
+            fi
+            # Reapply our routing rules too
+            /usr/bin/awg-routing apply
+        fi
+
+        [ $first -eq 1 ] && first=0 || printf ','  >> /tmp/awg_health_new.json
+        printf '"%s":"%s"' "$node" "$status" >> /tmp/awg_health_new.json
+    done
+    printf '}' >> /tmp/awg_health_new.json
+    mv /tmp/awg_health_new.json "$STATUS_FILE"
+}
+
+run_healthcheck
