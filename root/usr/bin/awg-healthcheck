@@ -1,58 +1,242 @@
 #!/bin/sh
-# awg-healthcheck v2.5 - Check AWG tunnels via handshake, notify mwan3
+# awg-healthcheck v4.0 - config-driven
 
 ROUTING_FILE="/etc/awg-manager/routing.json"
 STATUS_FILE="/etc/awg-manager/healthcheck.json"
-HANDSHAKE_TIMEOUT=180  # 3 min
+HISTORY_FILE="/etc/awg-manager/healthcheck_history.json"
+CONFIG_FILE="/etc/awg-manager/healthcheck_config.json"
+
+# Defaults (overridden by config file)
+MAX_LATENCY=500
+MAX_LOSS=10
+MIN_SUCCESS=6
+MAX_FAIL=3
+PING_COUNT=5
+TUNNEL_TARGET1="8.8.8.8"
+TUNNEL_TARGET2="9.9.9.9"
+DISABLED=0
+
+load_config() {
+    [ -f "$CONFIG_FILE" ] || return
+    local cfg=$(cat "$CONFIG_FILE")
+    local v
+    v=$(echo "$cfg" | grep -o '"max_latency":[0-9]*' | cut -d: -f2)
+    [ -n "$v" ] && MAX_LATENCY=$v
+    v=$(echo "$cfg" | grep -o '"max_loss":[0-9]*' | cut -d: -f2)
+    [ -n "$v" ] && MAX_LOSS=$v
+    v=$(echo "$cfg" | grep -o '"min_success":[0-9]*' | cut -d: -f2)
+    [ -n "$v" ] && MIN_SUCCESS=$v
+    v=$(echo "$cfg" | grep -o '"max_fail":[0-9]*' | cut -d: -f2)
+    [ -n "$v" ] && MAX_FAIL=$v
+    v=$(echo "$cfg" | grep -o '"ping_count":[0-9]*' | cut -d: -f2)
+    [ -n "$v" ] && PING_COUNT=$v
+    local targets=$(echo "$cfg" | grep -o '"tunnel_targets":\[[^]]*\]' | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | tr -d '"')
+    local t1=$(echo "$targets" | sed -n '1p')
+    local t2=$(echo "$targets" | sed -n '2p')
+    [ -n "$t1" ] && TUNNEL_TARGET1=$t1
+    [ -n "$t2" ] && TUNNEL_TARGET2=$t2
+    echo "$cfg" | grep -q '"disabled":true' && DISABLED=1 || DISABLED=0
+}
 
 log() { logger -t awg-healthcheck "$1"; }
 
+mark_all_up() {
+    local nodes=$(get_all_nodes | sort -u)
+    [ -z "$nodes" ] && echo '{}' > "$STATUS_FILE" && return
+    printf '{' > /tmp/awg_health_new.json
+    local first=1
+    for node in $nodes; do
+        [ -z "$node" ] && continue
+        [ $first -eq 1 ] && first=0 || printf ',' >> /tmp/awg_health_new.json
+        printf '"%s":{"status":"up","latency":0,"loss":0}' "$node" >> /tmp/awg_health_new.json
+    done
+    printf '}' >> /tmp/awg_health_new.json
+    mv /tmp/awg_health_new.json "$STATUS_FILE"
+}
+
+get_endpoint_ip() {
+    local iface=$1
+    local peer_section=$(uci show network 2>/dev/null | grep "amneziawg_${iface}\." | grep -v "^network\.${iface}\." | cut -d. -f1-2 | sort -u | head -5)
+    for section in $peer_section; do
+        local has_default=$(uci get ${section}.allowed_ips 2>/dev/null | grep -c "0\.0\.0\.0/0")
+        [ "$has_default" -gt 0 ] || continue
+        local ep=$(uci get ${section}.endpoint_host 2>/dev/null)
+        [ -n "$ep" ] && echo "$ep" && return
+    done
+    uci show network 2>/dev/null | grep "amneziawg_${iface}" | grep endpoint_host | head -1 | cut -d= -f2 | tr -d "'"
+}
+
+ping_test() {
+    local iface=$1 target=$2 use_iface=$3
+    local args="-c $PING_COUNT -W 3"
+    [ "$use_iface" = "1" ] && args="$args -I $iface"
+    local result=$(ping $args $target 2>/dev/null)
+    [ $? -ne 0 ] && echo "fail" && return
+    local loss=$(echo "$result" | grep "packet loss" | grep -oE '[0-9]+%' | tr -d '%')
+    local avg=$(echo "$result" | grep "round-trip\|rtt" | grep -oE '[0-9]+\.[0-9]+' | sed -n '2p' | cut -d. -f1)
+    [ -z "$avg" ] && avg=$(echo "$result" | grep "round-trip\|rtt" | grep -oE '[0-9]+' | sed -n '2p')
+    [ -z "$loss" ] && loss=100
+    [ -z "$avg" ] && echo "fail" && return
+    echo "$avg $loss"
+}
+
 check_iface() {
     local iface=$1
-    ping -I "$iface" -c 2 -W 3 8.8.8.8 > /dev/null 2>&1 && echo "up" || echo "down"
+    local endpoint=$(get_endpoint_ip "$iface")
+    local endpoint_ok=0
+    local endpoint_loss=0
+    if [ -n "$endpoint" ]; then
+        local ep_result=$(ping -c 5 -W 2 "$endpoint" 2>/dev/null)
+        if [ $? -eq 0 ]; then
+            endpoint_ok=1
+            endpoint_loss=$(echo "$ep_result" | grep "packet loss" | grep -oE '[0-9]+%' | tr -d '%')
+            [ -z "$endpoint_loss" ] && endpoint_loss=0
+            if [ "$endpoint_loss" -ge "$MAX_LOSS" ] 2>/dev/null; then
+                log "$iface: endpoint loss ${endpoint_loss}% >= ${MAX_LOSS}%"
+                echo "degraded 0 $endpoint_loss"
+                return
+            fi
+        fi
+    fi
+    local r1=$(ping_test "$iface" "$TUNNEL_TARGET1" "1")
+    local r2=$(ping_test "$iface" "$TUNNEL_TARGET2" "1")
+    if [ "$r1" = "fail" ] && [ "$r2" = "fail" ]; then
+        [ $endpoint_ok -eq 0 ] && log "$iface: endpoint unreachable + tunnel fail" || log "$iface: endpoint OK but tunnel fail"
+        echo "down 0 100"
+        return
+    fi
+    local total_lat=0 total_loss=0 cnt=0
+    if [ "$r1" != "fail" ]; then
+        total_lat=$((total_lat + $(echo "$r1" | cut -d' ' -f1)))
+        total_loss=$((total_loss + $(echo "$r1" | cut -d' ' -f2)))
+        cnt=$((cnt + 1))
+    else
+        total_loss=$((total_loss + 100)); cnt=$((cnt + 1))
+    fi
+    if [ "$r2" != "fail" ]; then
+        total_lat=$((total_lat + $(echo "$r2" | cut -d' ' -f1)))
+        total_loss=$((total_loss + $(echo "$r2" | cut -d' ' -f2)))
+        cnt=$((cnt + 1))
+    else
+        total_loss=$((total_loss + 100)); cnt=$((cnt + 1))
+    fi
+    local latency=$((total_lat / cnt))
+    local loss=$((total_loss / cnt))
+    if [ "$latency" -gt "$MAX_LATENCY" ] 2>/dev/null; then
+        log "$iface: high latency ${latency}ms"; echo "degraded $latency $loss"; return
+    fi
+    if [ "$loss" -gt "$MAX_LOSS" ] 2>/dev/null; then
+        log "$iface: high loss ${loss}%"; echo "degraded $latency $loss"; return
+    fi
+    echo "up $latency $loss"
+}
+
+get_history() {
+    local node=$1 field=$2
+    [ -f "$HISTORY_FILE" ] || return
+    grep -o "\"${node}_${field}\":[0-9]*" "$HISTORY_FILE" | cut -d: -f2
+}
+
+set_history() {
+    local node=$1 fail_count=$2 success_count=$3
+    [ -f "$HISTORY_FILE" ] || echo '{}' > "$HISTORY_FILE"
+    local json=$(cat "$HISTORY_FILE")
+    json=$(echo "$json" | sed "s/\"${node}_f\":[0-9]*,\?//g;s/,\"${node}_f\":[0-9]*//g")
+    json=$(echo "$json" | sed "s/\"${node}_s\":[0-9]*,\?//g;s/,\"${node}_s\":[0-9]*//g")
+    json=$(echo "$json" | sed 's/,}/}/g;s/{,/{/g;s/,,/,/g')
+    local new=$(echo "$json" | sed "s/}$/,\"${node}_f\":$fail_count,\"${node}_s\":$success_count}/;s/^{,/{/")
+    echo "$new" > "$HISTORY_FILE"
 }
 
 get_all_nodes() {
     [ -f "$ROUTING_FILE" ] || return
     local json=$(cat "$ROUTING_FILE")
-    # Cascade exit nodes
     echo "$json" | grep -oE '"to":"[^"]*"' | cut -d'"' -f4
-    # Policy rule exit nodes
     echo "$json" | grep -oE '"exit":"[^"]*"' | cut -d'"' -f4
-    # Balancer nodes
     echo "$json" | grep -oE '"iface":"[^"]*"' | cut -d'"' -f4
+    # Also check AWG nodes registered in exitnodes.json
+    if [ -f "/etc/awg-manager/exitnodes.json" ]; then
+        grep -o '"[^"]*":{"type":"awg"' /etc/awg-manager/exitnodes.json | sed 's/"//g;s/:{//g;s/type:awg//g'
+    fi
 }
 
 run_healthcheck() {
-    local mwan3_ok=0
-    which mwan3 > /dev/null 2>&1 && mwan3_ok=1
-
+    local routing_changed=0
+    [ -f "$HISTORY_FILE" ] || echo '{}' > "$HISTORY_FILE"
     printf '{' > /tmp/awg_health_new.json
     local first=1
-
     for node in $(get_all_nodes | sort -u); do
         [ -z "$node" ] && continue
-        local status=$(check_iface "$node")
-        local prev=""
-        [ -f "$STATUS_FILE" ] && prev=$(grep -o "\"$node\":\"[^\"]*\"" "$STATUS_FILE" | cut -d'"' -f4)
-
-        # Notify mwan3 if status changed
-        if [ "$status" != "$prev" ] && [ $mwan3_ok -eq 1 ]; then
-            log "Node $node: $prev -> $status"
-            if [ "$status" = "up" ]; then
-                mwan3 use interface "$node" online 2>/dev/null
+        local check_result=$(check_iface "$node")
+        local result=$(echo "$check_result" | awk '{print $1}')
+        local latency=$(echo "$check_result" | awk '{print $2}')
+        local loss=$(echo "$check_result" | awk '{print $3}')
+        [ -z "$latency" ] && latency=0
+        [ -z "$loss" ] && loss=0
+        local prev_status=""
+        [ -f "$STATUS_FILE" ] && \
+            prev_status=$(grep -o "\"$node\":{\"status\":\"[^\"]*\"" "$STATUS_FILE" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+        [ -z "$prev_status" ] && prev_status="unknown"
+        local fail_count=$(get_history "$node" "f")
+        local success_count=$(get_history "$node" "s")
+        [ -z "$fail_count" ] && fail_count=0
+        [ -z "$success_count" ] && success_count=0
+        local new_status=""
+        if [ "$result" = "down" ]; then
+            fail_count=$((fail_count + 1)); success_count=0; latency=0
+            [ $fail_count -ge $MAX_FAIL ] && new_status="down" || new_status="$prev_status"
+        elif [ "$result" = "degraded" ]; then
+            fail_count=$((fail_count + 1)); success_count=0; new_status="degraded"
+        else
+            fail_count=0; success_count=$((success_count + 1))
+            if [ "$prev_status" = "down" ] || [ "$prev_status" = "degraded" ]; then
+                [ $success_count -ge $MIN_SUCCESS ] && new_status="up" || new_status="$prev_status"
             else
-                mwan3 use interface "$node" offline 2>/dev/null
+                new_status="up"
             fi
-            # Reapply our routing rules too
-            /usr/bin/awg-routing apply
         fi
-
-        [ $first -eq 1 ] && first=0 || printf ','  >> /tmp/awg_health_new.json
-        printf '"%s":"%s"' "$node" "$status" >> /tmp/awg_health_new.json
+        set_history "$node" "$fail_count" "$success_count"
+        if [ "$new_status" != "$prev_status" ]; then
+            log "Node $node: $prev_status -> $new_status (${latency}ms loss=${loss}%)"
+            routing_changed=1
+        fi
+        [ $first -eq 1 ] && first=0 || printf ',' >> /tmp/awg_health_new.json
+        printf '"%s":{"status":"%s","latency":%s,"loss":%s}' \
+            "$node" "$new_status" "$latency" "$loss" >> /tmp/awg_health_new.json
     done
     printf '}' >> /tmp/awg_health_new.json
-    mv /tmp/awg_health_new.json "$STATUS_FILE"
+
+    # Preserve singbox entries from existing healthcheck.json
+    if [ -f "$STATUS_FILE" ]; then
+        local awg_nodes=$(get_all_nodes | sort -u)
+        local sb_entries=""
+        local existing=$(cat "$STATUS_FILE")
+        for entry_name in $(echo "$existing" | grep -o '"[^"]*":{"status"' | cut -d'"' -f2); do
+            echo "$awg_nodes" | grep -qw "$entry_name" && continue
+            local sb_e=$(echo "$existing" | grep -o "\"$entry_name\":{[^}]*}")
+            [ -n "$sb_e" ] && sb_entries="$sb_entries,$sb_e"
+        done
+        if [ -n "$sb_entries" ]; then
+            local new_content=$(cat /tmp/awg_health_new.json)
+            new_content=$(echo "$new_content" | sed "s/}$/$sb_entries}/")
+            echo "$new_content" > "$STATUS_FILE"
+            rm -f /tmp/awg_health_new.json
+        else
+            mv /tmp/awg_health_new.json "$STATUS_FILE"
+        fi
+    else
+        mv /tmp/awg_health_new.json "$STATUS_FILE"
+    fi
+    [ $routing_changed -eq 1 ] && /usr/bin/awg-routing apply
 }
+
+# ── Main ──
+load_config
+
+if [ "$DISABLED" = "1" ]; then
+    log "healthcheck disabled, marking all nodes up"
+    mark_all_up
+    exit 0
+fi
 
 run_healthcheck

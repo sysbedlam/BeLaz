@@ -1,0 +1,2 @@
+*/2 * * * * /usr/bin/awg-healthcheck
+1-59/2 * * * * /usr/bin/singbox-healthcheck

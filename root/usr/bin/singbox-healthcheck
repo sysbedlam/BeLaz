@@ -1,0 +1,203 @@
+#!/bin/sh
+# singbox-healthcheck v2.0 - uses Clash API for real latency measurement
+
+EXITNODES_FILE="/etc/awg-manager/exitnodes.json"
+STATUS_FILE="/etc/awg-manager/healthcheck.json"
+HISTORY_FILE="/etc/awg-manager/healthcheck_history.json"
+CONFIG_FILE="/etc/awg-manager/healthcheck_singbox_config.json"
+
+# Defaults
+DISABLED=0
+CHECK_AVAILABILITY=1
+CHECK_LATENCY=1
+MAX_LATENCY=2000
+MIN_SUCCESS=3
+MAX_FAIL=3
+DELAY_URL="http://cp.cloudflare.com"
+DELAY_TIMEOUT=5000
+
+log() { logger -t singbox-healthcheck "$1"; }
+
+load_config() {
+    [ -f "$CONFIG_FILE" ] || return
+    local cfg=$(cat "$CONFIG_FILE")
+    local v
+    v=$(echo "$cfg" | grep -o '"max_latency":[0-9]*' | cut -d: -f2); [ -n "$v" ] && MAX_LATENCY=$v
+    v=$(echo "$cfg" | grep -o '"min_success":[0-9]*' | cut -d: -f2); [ -n "$v" ] && MIN_SUCCESS=$v
+    v=$(echo "$cfg" | grep -o '"max_fail":[0-9]*' | cut -d: -f2); [ -n "$v" ] && MAX_FAIL=$v
+    echo "$cfg" | grep -q '"disabled":true' && DISABLED=1 || DISABLED=0
+    echo "$cfg" | grep -q '"check_availability":false' && CHECK_AVAILABILITY=0
+    echo "$cfg" | grep -q '"check_latency":false' && CHECK_LATENCY=0
+    local u=$(echo "$cfg" | grep -o '"ip_check_url":"[^"]*"' | cut -d'"' -f4)
+    [ -n "$u" ] && DELAY_URL=$u
+    local t=$(echo "$cfg" | grep -o '"delay_timeout":[0-9]*' | cut -d: -f2)
+    [ -n "$t" ] && DELAY_TIMEOUT=$t
+}
+
+get_singbox_nodes() {
+    [ -f "$EXITNODES_FILE" ] || return
+    grep -o '"[^"]*":{"type":"singbox"' "$EXITNODES_FILE" | sed 's/"//g;s/:{//g;s/type:singbox//g' | tr -d ' '
+}
+
+get_node_clash_port() {
+    local node=$1
+    [ -f "$EXITNODES_FILE" ] || echo ""
+    grep -o "\"$node\":{[^}]*}" "$EXITNODES_FILE" | grep -o '"clash_port":[0-9]*' | cut -d: -f2
+}
+
+check_singbox_node() {
+    local iface=$1
+    local clash_port=$2
+
+    # Check if interface is up
+    if ! ip link show "$iface" 2>/dev/null | grep -q "UP"; then
+        log "$iface: interface down"
+        echo "down 0 100"
+        return
+    fi
+
+    # No clash port - just check interface
+    if [ -z "$clash_port" ]; then
+        log "$iface: no clash_port configured, checking interface only"
+        echo "up 0 0"
+        return
+    fi
+
+    # Check availability via Clash API delay endpoint
+    local result=$(wget -q -O - \
+        "http://127.0.0.1:${clash_port}/proxies/proxy-out/delay?url=${DELAY_URL}&timeout=${DELAY_TIMEOUT}" \
+        2>/dev/null)
+
+    if [ -z "$result" ]; then
+        log "$iface: Clash API not responding on port $clash_port"
+        echo "down 0 100"
+        return
+    fi
+
+    local latency=$(echo "$result" | grep -o '"delay":[0-9]*' | cut -d: -f2)
+
+    if [ -z "$latency" ]; then
+        # Check for error response
+        log "$iface: delay test failed - $(echo "$result" | grep -o '"message":"[^"]*"' | cut -d'"' -f4)"
+        echo "down 0 100"
+        return
+    fi
+
+    if [ "$CHECK_LATENCY" = "1" ] && [ "$latency" -gt "$MAX_LATENCY" ] 2>/dev/null; then
+        log "$iface: high latency ${latency}ms > ${MAX_LATENCY}ms"
+        echo "degraded $latency 0"
+        return
+    fi
+
+    echo "up $latency 0"
+}
+
+get_history() {
+    local node=$1 field=$2
+    [ -f "$HISTORY_FILE" ] || return
+    grep -o "\"${node}_${field}\":[0-9]*" "$HISTORY_FILE" | cut -d: -f2
+}
+
+set_history() {
+    local node=$1 fail_count=$2 success_count=$3
+    [ -f "$HISTORY_FILE" ] || echo '{}' > "$HISTORY_FILE"
+    local json=$(cat "$HISTORY_FILE")
+    json=$(echo "$json" | sed "s/\"${node}_f\":[0-9]*,\?//g;s/,\"${node}_f\":[0-9]*//g")
+    json=$(echo "$json" | sed "s/\"${node}_s\":[0-9]*,\?//g;s/,\"${node}_s\":[0-9]*//g")
+    json=$(echo "$json" | sed 's/,}/}/g;s/{,/{/g;s/,,/,/g')
+    local new=$(echo "$json" | sed "s/}$/,\"${node}_f\":$fail_count,\"${node}_s\":$success_count}/;s/^{,/{/")
+    echo "$new" > "$HISTORY_FILE"
+}
+
+mark_all_up() {
+    [ -f "$STATUS_FILE" ] || echo '{}' > "$STATUS_FILE"
+    for node in $(get_singbox_nodes); do
+        [ -z "$node" ] && continue
+        local json=$(cat "$STATUS_FILE")
+        local entry="\"$node\":{\"status\":\"up\",\"latency\":0,\"loss\":0}"
+        if echo "$json" | grep -q "\"$node\":"; then
+            json=$(echo "$json" | sed "s/\"$node\":{[^}]*}/$entry/")
+        else
+            json=$(echo "$json" | sed "s/}$/,$entry}/;s/^{,/{/")
+        fi
+        echo "$json" > "$STATUS_FILE"
+    done
+}
+
+update_status() {
+    local node=$1 new_status=$2 latency=$3 loss=$4
+    [ -f "$STATUS_FILE" ] || echo '{}' > "$STATUS_FILE"
+    local json=$(cat "$STATUS_FILE")
+    local entry="\"$node\":{\"status\":\"$new_status\",\"latency\":$latency,\"loss\":$loss}"
+    if echo "$json" | grep -q "\"$node\":"; then
+        json=$(echo "$json" | sed "s/\"$node\":{[^}]*}/$entry/")
+    else
+        json=$(echo "$json" | sed "s/}$/,$entry}/;s/^{,/{/")
+    fi
+    echo "$json" > "$STATUS_FILE"
+}
+
+run_healthcheck() {
+    [ -f "$HISTORY_FILE" ] || echo '{}' > "$HISTORY_FILE"
+    [ -f "$STATUS_FILE" ] || echo '{}' > "$STATUS_FILE"
+    local routing_changed=0
+
+    for node in $(get_singbox_nodes); do
+        [ -z "$node" ] && continue
+        local clash_port=$(get_node_clash_port "$node")
+        local check_result=$(check_singbox_node "$node" "$clash_port")
+        local result=$(echo "$check_result" | awk '{print $1}')
+        local latency=$(echo "$check_result" | awk '{print $2}')
+        local loss=$(echo "$check_result" | awk '{print $3}')
+        [ -z "$latency" ] && latency=0
+        [ -z "$loss" ] && loss=0
+
+        local prev_status=""
+        [ -f "$STATUS_FILE" ] && \
+            prev_status=$(grep -o "\"$node\":{\"status\":\"[^\"]*\"" "$STATUS_FILE" | \
+                grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+        [ -z "$prev_status" ] && prev_status="unknown"
+
+        local fail_count=$(get_history "$node" "f")
+        local success_count=$(get_history "$node" "s")
+        [ -z "$fail_count" ] && fail_count=0
+        [ -z "$success_count" ] && success_count=0
+
+        local new_status=""
+        if [ "$result" = "down" ]; then
+            fail_count=$((fail_count + 1)); success_count=0; latency=0
+            [ $fail_count -ge $MAX_FAIL ] && new_status="down" || new_status="${prev_status:-down}"
+        elif [ "$result" = "degraded" ]; then
+            fail_count=$((fail_count + 1)); success_count=0; new_status="degraded"
+        else
+            fail_count=0; success_count=$((success_count + 1))
+            if [ "$prev_status" = "down" ] || [ "$prev_status" = "degraded" ]; then
+                [ $success_count -ge $MIN_SUCCESS ] && new_status="up" || new_status="$prev_status"
+            else
+                new_status="up"
+            fi
+        fi
+
+        set_history "$node" "$fail_count" "$success_count"
+
+        if [ "$new_status" != "$prev_status" ]; then
+            log "Node $node: $prev_status -> $new_status (${latency}ms)"
+            routing_changed=1
+        fi
+
+        update_status "$node" "$new_status" "$latency" "$loss"
+    done
+
+    [ $routing_changed -eq 1 ] && /usr/bin/awg-routing apply
+}
+
+# ── Main ──
+load_config
+
+if [ "$DISABLED" = "1" ]; then
+    log "singbox healthcheck disabled"
+    mark_all_up
+    exit 0
+fi
+
+run_healthcheck

@@ -3,7 +3,7 @@
 'require fs';
 'require ui';
 
-var VERSION = '0.0.1';
+var VERSION = '0.7.2';
 
 return view.extend({
 
@@ -13,7 +13,8 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			fs.exec('/usr/bin/awg-manager-backend', ['list_servers']).catch(() => ({ stdout: '[]' })),
-			fs.stat('/usr/bin/awg').catch(() => null)
+			fs.stat('/usr/bin/awg').catch(() => null),
+			fs.exec('/usr/bin/awg-manager-backend', ['ip_full_check']).catch(() => ({ stdout: 'not_installed' }))
 		]);
 	},
 
@@ -39,6 +40,7 @@ return view.extend({
 		var servers = [];
 		try { servers = JSON.parse(data[0].stdout || '[]'); } catch(e) {}
 		var awgInstalled = data[1] !== null;
+		var ipFullInstalled = (data[2].stdout || '').trim() === 'installed';
 		var self = this;
 
 		if (self.currentServer === null && servers.length > 0)
@@ -48,6 +50,12 @@ return view.extend({
 			E('h4', {}, _('AmneziaWG not installed')),
 			E('p', {}, _('Install via SSH:')),
 			E('pre', {}, 'sh <(wget -O - https://raw.githubusercontent.com/Slava-Shchipunov/awg-openwrt/refs/heads/master/amneziawg-install.sh)')
+		])] : [];
+
+		var ipFullBanner = !ipFullInstalled ? [E('div', { 'class': 'alert-message warning' }, [
+			E('h4', {}, 'ip-full ' + _('not installed')),
+			E('p', {}, _('Required for load balancing. Install:')),
+			E('pre', {}, 'opkg update && opkg install ip-full')
 		])] : [];
 
 		// Server selector row
@@ -69,9 +77,17 @@ return view.extend({
 				'click': function() { self.showCreateServerForm(); }
 			}, '+ ' + _('New server')),
 			E('button', { 'class': 'btn cbi-button',
+				'style': 'background:#4a7c59;color:#fff',
+				'click': function() { self.showExitNodes(); }
+			}, '⬆ ' + _('Exit Nodes')),
+			E('button', { 'class': 'btn cbi-button',
 				'style': 'background:#5b7fa6;color:#fff',
 				'click': function() { self.showAddressLists(); }
-			}, '☰ ' + _('Address Lists'))
+			}, '☰ ' + _('Address Lists')),
+			E('button', { 'class': 'btn cbi-button',
+				'style': 'background:#6c757d;color:#fff',
+				'click': function() { self.showGlobalSettings(); }
+			}, '⚙ ' + _('Global Settings'))
 		]);
 
 		var serverView = E('div', { 'id': 'server-view' });
@@ -98,7 +114,7 @@ return view.extend({
 				E('a', { 'href': 'https://beit24.ru', 'target': '_blank', 'style': 'color:#5b7fa6;font-size:13px;text-decoration:none' }, 'beit24.ru')
 			]),
 			E('div', { 'id': 'awg-msg', 'style': 'display:none;padding:10px;margin-bottom:10px;border-radius:4px' }),
-		].concat(installBanner).concat([
+		].concat(installBanner).concat(ipFullBanner).concat([
 			E('div', { 'class': 'cbi-section' }, [ selectorRow, serverView ])
 		]));
 	},
@@ -139,17 +155,11 @@ return view.extend({
 
 		var showTab = function(t) {
 			self.serverTab[name] = t;
-			['info','clients','routing'].forEach(function(id) {
+			['info','clients','routing','diag'].forEach(function(id) {
 				var content = document.getElementById('tab-' + id + '-' + name);
 				var btn = document.getElementById('btn-' + id + '-' + name);
 				if (content) content.style.display = id === t ? 'block' : 'none';
-				if (btn) {
-					if (id === t) {
-						btn.className = 'cbi-tab';
-					} else {
-						btn.className = 'cbi-tab cbi-tab-disabled';
-					}
-				}
+				if (btn) btn.className = id === t ? 'cbi-tab' : 'cbi-tab cbi-tab-disabled';
 			});
 		};
 
@@ -163,7 +173,10 @@ return view.extend({
 			}, E('a', { 'href': '#' }, _('Clients') + (clients.length > 0 ? ' (' + clients.length + ')' : ''))),
 			E('li', { 'id': 'btn-routing-' + name, 'class': activeTab === 'routing' ? 'cbi-tab' : 'cbi-tab cbi-tab-disabled',
 				'click': function() { showTab('routing'); }
-			}, E('a', { 'href': '#' }, _('Routing')))
+			}, E('a', { 'href': '#' }, _('Routing'))),
+			E('li', { 'id': 'btn-diag-' + name, 'class': activeTab === 'diag' ? 'cbi-tab' : 'cbi-tab cbi-tab-disabled',
+				'click': function() { showTab('diag'); }
+			}, E('a', { 'href': '#' }, _('Diagnostics')))
 		]);
 
 		// ── Tab: Information ──
@@ -233,9 +246,13 @@ return view.extend({
 		var tabRouting = E('div', { 'id': 'tab-routing-' + name, 'style': activeTab === 'routing' ? '' : 'display:none' });
 		tabRouting.appendChild(self.renderRoutingTab(name, routing, interfaces, health, lists));
 
+		// ── Tab: Diagnostics ──
+		var tabDiag = E('div', { 'id': 'tab-diag-' + name, 'style': activeTab === 'diag' ? '' : 'display:none' });
+		tabDiag.appendChild(self.renderDiagTab(name));
+
 		return E('div', {}, [
 			tabBtns,
-			E('div', { 'class': 'cbi-tabcontainer' }, [ tabInfo, tabClients, tabRouting ])
+			E('div', { 'class': 'cbi-tabcontainer' }, [ tabInfo, tabClients, tabRouting, tabDiag ])
 		]);
 	},
 
@@ -568,6 +585,385 @@ return view.extend({
 		});
 	},
 
+	showExitNodes: function() {
+		var self = this;
+		fs.exec('/usr/bin/awg-manager-backend', ['get_exitnodes']).then(function(r) {
+			var data = {"nodes":[]};
+			try { data = JSON.parse(r.stdout); } catch(e) {}
+			self.renderExitNodesModal(data);
+		});
+	},
+
+	renderExitNodesModal: function(data) {
+		var self = this;
+		var nodes = data.nodes || [];
+
+		function typeBadge(type) {
+			var color = type === 'singbox' ? '#7b5ea7' : type === 'system' ? '#888' : '#5b7fa6';
+			var label = type === 'singbox' ? 'SingBox' : type === 'system' ? 'System' : 'AWG';
+			return E('span', { 'style': 'background:'+color+';color:#fff;padding:1px 7px;border-radius:3px;font-size:11px;margin-left:6px' }, label);
+		}
+
+		function statusBadge(status, latency) {
+			if (!status || status === 'unknown') return E('span', { 'style': 'color:#aaa;font-size:11px' }, '—');
+			var color = status === 'up' ? '#4a7c59' : status === 'degraded' ? '#e08c00' : '#a94442';
+			var text = status === 'up' ? '✓ ' + (latency > 0 ? latency + 'ms' : 'up') :
+			           status === 'degraded' ? '⚠ ' + latency + 'ms' : '✗ down';
+			return E('span', { 'style': 'background:'+color+';color:#fff;padding:1px 8px;border-radius:3px;font-size:11px' }, text);
+		}
+
+		var tbody = E('tbody', {});
+		if (nodes.length === 0) {
+			tbody.appendChild(E('tr', {}, [
+				E('td', { 'colspan': '4', 'style': 'padding:16px;text-align:center;color:#999' }, _('No exit nodes in WAN zone'))
+			]));
+		}
+		nodes.forEach(function(node) {
+			var isSystem = node.system === true;
+			var displayName = node.display_name || node.iface;
+			tbody.appendChild(E('tr', {}, [
+				E('td', { 'style': 'padding:6px 8px;font-weight:bold' }, [ E('span', {}, displayName), typeBadge(node.type) ]),
+				E('td', { 'style': 'padding:6px 8px;color:#666;font-size:12px' }, node.iface),
+				E('td', { 'style': 'padding:6px 8px;color:#666;font-size:12px' }, node.server || '\u2014'),
+				E('td', { 'style': 'padding:6px 8px' }, statusBadge(node.status, node.latency)),
+				E('td', { 'style': 'padding:6px 8px' }, isSystem ?
+					E('span', { 'style': 'color:#aaa;font-size:11px' }, _('system')) :
+					E('button', {
+						'class': 'btn cbi-button cbi-button-remove',
+						'style': 'font-size:11px;padding:2px 8px',
+						'click': (function(n) { return function() {
+							if (!confirm(_('Delete exit node ') + n + '?')) return;
+							fs.exec('/usr/bin/awg-manager-backend', ['delete_exitnode', n]).then(function() { self.showExitNodes(); });
+						}; })(node.iface)
+					}, '\u2715 ' + _('Delete'))
+				)
+			]));
+		});
+
+		ui.showModal(_('Exit Nodes'), [
+			E('table', { 'style': 'width:100%;border-collapse:collapse' }, [
+				E('thead', {}, E('tr', {}, [
+					E('th', { 'style': 'padding:6px 8px;text-align:left;border-bottom:2px solid #ddd' }, _('Name')),
+					E('th', { 'style': 'padding:6px 8px;text-align:left;border-bottom:2px solid #ddd' }, _('Interface')),
+					E('th', { 'style': 'padding:6px 8px;text-align:left;border-bottom:2px solid #ddd' }, _('Server')),
+					E('th', { 'style': 'padding:6px 8px;text-align:left;border-bottom:2px solid #ddd' }, _('Status')),
+					E('th', { 'style': 'padding:6px 8px;text-align:left;border-bottom:2px solid #ddd' }, _('Action'))
+				])),
+				tbody
+			]),
+			E('div', { 'style': 'display:flex;justify-content:space-between;margin-top:16px' }, [
+				E('div', { 'style': 'display:flex;gap:8px' }, [
+					E('button', { 'class': 'btn cbi-button cbi-button-add',
+						'click': function() { ui.hideModal(); self.showAddAwgNode(); }
+					}, '+ ' + _('Add AWG node')),
+					E('button', { 'class': 'btn cbi-button', 'style': 'background:#7b5ea7;color:#fff',
+						'click': function() { ui.hideModal(); self.showAddVlessNode(); }
+					}, '+ ' + _('Add VLESS node'))
+				]),
+				E('button', { 'class': 'btn cbi-button', 'click': function() { ui.hideModal(); } }, _('Close'))
+			])
+		]);
+	},
+
+	showAddAwgNode: function() {
+		var self = this;
+		var ifaceInput = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:160px', 'placeholder': 'fin_exit' });
+		var displayInput = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:200px', 'placeholder': 'Finland Exit' });
+		var confArea = E('textarea', { 'class': 'cbi-input-text',
+			'style': 'width:100%;height:120px;font-size:11px;font-family:monospace',
+			'placeholder': '[Interface]\nPrivateKey = ...\n\n[Peer]\nPublicKey = ...\nEndpoint = host:port'
+		});
+		var statusDiv = E('div', { 'style': 'font-size:12px;margin-top:4px' });
+		confArea.addEventListener('dragover', function(e) { e.preventDefault(); });
+		confArea.addEventListener('drop', function(e) {
+			e.preventDefault();
+			var file = e.dataTransfer.files[0];
+			if (file) { var r = new FileReader(); r.onload = function(ev) { confArea.value = ev.target.result.trim(); }; r.readAsText(file); }
+		});
+		ui.showModal(_('Add AWG Exit Node'), [
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('Interface name')),
+				E('div', { 'class': 'cbi-value-field' }, [ ifaceInput, E('span', { 'style': 'font-size:11px;color:#999;margin-left:6px' }, _('e.g. fin_exit')) ])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('Display name')),
+				E('div', { 'class': 'cbi-value-field' }, [ displayInput ])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('Config (.conf)')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					confArea,
+					E('div', { 'style': 'font-size:11px;color:#999;margin-top:2px' }, _('Paste config or drag & drop .conf file'))
+				])
+			]),
+			statusDiv,
+			E('div', { 'style': 'display:flex;justify-content:flex-end;gap:8px;margin-top:16px' }, [
+				E('button', { 'class': 'btn cbi-button', 'click': function() { ui.hideModal(); self.showExitNodes(); } }, _('Cancel')),
+				E('button', { 'class': 'btn cbi-button cbi-button-apply', 'click': function() {
+					var iface = ifaceInput.value.trim();
+					var display = displayInput.value.trim() || iface;
+					var conf = confArea.value.trim();
+					if (!iface || !conf) { statusDiv.textContent = _('Fill in all fields'); statusDiv.style.color = '#a94442'; return; }
+					if (!conf.includes('[Interface]') || !conf.includes('[Peer]')) {
+						statusDiv.textContent = _('Invalid config'); statusDiv.style.color = '#a94442'; return;
+					}
+					statusDiv.textContent = _('Creating... this may take 10-15 seconds'); statusDiv.style.color = '#666';
+					fs.exec('/usr/bin/awg-manager-backend', ['create_awg_exitnode', iface, conf, display]).then(function(r) {
+						if ((r.stdout || '').trim() === 'ok') { ui.hideModal(); self.showExitNodes(); }
+						else { statusDiv.style.color = '#a94442'; statusDiv.textContent = _('Error: ') + (r.stdout || '').trim(); }
+					}).catch(function(e) {
+						var errStr = String(e);
+						if (errStr.indexOf('timed out') !== -1 || errStr.indexOf('XHR') !== -1) {
+							statusDiv.style.color = '#4a7c59';
+							statusDiv.textContent = _('Creating in background... close this window and check Exit Nodes in 15 seconds.');
+						} else {
+							statusDiv.style.color = '#a94442';
+							statusDiv.textContent = _('Error: ') + errStr;
+						}
+					});
+				}}, _('Create'))
+			])
+		]);
+	},
+
+	showAddVlessNode: function() {
+		var self = this;
+		var ifaceInput = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:160px', 'placeholder': 'vless0' });
+		var displayInput = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:200px', 'placeholder': 'UK Exit' });
+		var linkInput = E('textarea', { 'class': 'cbi-input-text', 'style': 'width:100%;height:70px;font-size:11px;font-family:monospace', 'placeholder': 'vless://...' });
+		var statusDiv = E('div', { 'style': 'font-size:12px;margin-top:4px' });
+		ui.showModal(_('Add VLESS Exit Node'), [
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('Interface name')),
+				E('div', { 'class': 'cbi-value-field' }, [ ifaceInput, E('span', { 'style': 'font-size:11px;color:#999;margin-left:6px' }, _('e.g. vless0, uk_exit')) ])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('Display name')),
+				E('div', { 'class': 'cbi-value-field' }, [ displayInput ])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('VLESS link')),
+				E('div', { 'class': 'cbi-value-field' }, [ linkInput ])
+			]),
+			statusDiv,
+			E('div', { 'style': 'display:flex;justify-content:flex-end;gap:8px;margin-top:16px' }, [
+				E('button', { 'class': 'btn cbi-button', 'click': function() { ui.hideModal(); self.showExitNodes(); } }, _('Cancel')),
+				E('button', { 'class': 'btn cbi-button cbi-button-apply', 'click': function() {
+					var iface = ifaceInput.value.trim();
+					var display = displayInput.value.trim() || iface;
+					var link = linkInput.value.trim();
+					if (!iface || !link) { statusDiv.textContent = _('Fill in all fields'); statusDiv.style.color = '#a94442'; return; }
+					if (!link.startsWith('vless://')) { statusDiv.textContent = _('Only vless:// links supported'); statusDiv.style.color = '#a94442'; return; }
+					statusDiv.textContent = _('Creating... this may take 10-15 seconds'); statusDiv.style.color = '#666';
+					fs.exec('/usr/bin/awg-manager-backend', ['create_singbox_exitnode', iface, link, display]).then(function(r) {
+						if ((r.stdout || '').trim() === 'ok') { ui.hideModal(); self.showExitNodes(); }
+						else { statusDiv.style.color = '#a94442'; statusDiv.textContent = _('Error: ') + (r.stdout || r.stderr || 'unknown'); }
+					}).catch(function(e) {
+						var errStr = String(e);
+						if (errStr.indexOf('timed out') !== -1 || errStr.indexOf('XHR') !== -1) {
+							statusDiv.style.color = '#4a7c59';
+							statusDiv.textContent = _('Creating in background... close this window and check Exit Nodes in 15 seconds.');
+						} else {
+							statusDiv.style.color = '#a94442';
+							statusDiv.textContent = _('Error: ') + errStr;
+						}
+					});
+				}}, _('Create'))
+			])
+		]);
+	},
+
+	showGlobalSettings: function() {
+		var self = this;
+		Promise.all([
+			fs.exec('/usr/bin/awg-manager-backend', ['get_hc_config']),
+			fs.exec('/usr/bin/awg-manager-backend', ['get_hc_singbox_config'])
+		]).then(function(results) {
+			var awgCfg = {"disabled":false,"max_latency":500,"max_loss":10,"min_success":6,"max_fail":3,"ping_count":5,"tunnel_targets":["8.8.8.8","9.9.9.9"]};
+			var sbCfg = {"disabled":false,"max_latency":2000,"min_success":3,"max_fail":3,"ip_check_url":"http://cp.cloudflare.com","delay_timeout":5000};
+			try { awgCfg = JSON.parse(results[0].stdout); } catch(e) {}
+			try { sbCfg = JSON.parse(results[1].stdout); } catch(e) {}
+			self.renderGlobalSettingsModal(awgCfg, sbCfg);
+		});
+	},
+
+	renderGlobalSettingsModal: function(awgCfg, sbCfg) {
+		var self = this;
+		var activeTab = 'awg';
+
+		function tabBtn(id, label) {
+			return E('button', {
+				'id': 'gs-tab-' + id,
+				'style': 'padding:6px 16px;border:none;border-bottom:2px solid ' + (id === activeTab ? '#5b7fa6' : 'transparent') +
+					';background:none;cursor:pointer;font-weight:' + (id === activeTab ? 'bold' : 'normal') +
+					';color:' + (id === activeTab ? '#5b7fa6' : '#555'),
+				'click': function() {
+					activeTab = id;
+					renderContent();
+					['awg','singbox','logs'].forEach(function(t) {
+						var b = document.getElementById('gs-tab-' + t);
+						if (!b) return;
+						b.style.borderBottomColor = t === id ? '#5b7fa6' : 'transparent';
+						b.style.fontWeight = t === id ? 'bold' : 'normal';
+						b.style.color = t === id ? '#5b7fa6' : '#555';
+					});
+				}
+			}, label);
+		}
+
+		function numField(label, id, val, hint) {
+			return E('div', { 'class': 'cbi-value', 'style': 'margin-bottom:6px' }, [
+				E('label', { 'class': 'cbi-value-title', 'style': 'width:220px;display:inline-block;font-size:13px' }, label),
+				E('div', { 'class': 'cbi-value-field', 'style': 'display:inline-block' }, [
+					E('input', { 'id': id, 'type': 'text', 'class': 'cbi-input-text', 'value': String(val), 'style': 'width:90px' }),
+					hint ? E('span', { 'style': 'margin-left:8px;font-size:11px;color:#999' }, hint) : E('span')
+				])
+			]);
+		}
+
+		function checkField(label, id, checked) {
+			var chk = E('input', { 'id': id, 'type': 'checkbox', 'style': 'margin-right:6px' });
+			chk.checked = checked !== false;
+			return E('div', { 'style': 'margin-bottom:6px' }, [
+				E('label', { 'style': 'cursor:pointer;display:flex;align-items:center;gap:6px;font-size:13px' }, [ chk, label ])
+			]);
+		}
+
+		function disabledToggle(id, checked) {
+			return E('div', { 'style': 'padding:8px 12px;background:#fff8e1;border:1px solid #ffe082;border-radius:4px;margin-bottom:12px' }, [
+				E('label', { 'style': 'cursor:pointer;display:flex;align-items:center;gap:6px' }, [
+					(function() { var c = E('input', { 'id': id, 'type': 'checkbox', 'style': 'margin-right:4px' }); c.checked = checked === true; return c; })(),
+					E('strong', {}, _('Disable healthcheck')),
+					E('span', { 'style': 'color:#666;font-weight:normal;font-size:12px' }, ' — ' + _('all nodes forced UP'))
+				])
+			]);
+		}
+
+		var contentDiv = E('div', { 'id': 'gs-content', 'style': 'min-height:200px;margin-top:12px' });
+
+		function renderAwgTab() {
+			var targets = (awgCfg.tunnel_targets || ['8.8.8.8','9.9.9.9']).join(', ');
+			return E('div', {}, [
+				disabledToggle('gs-awg-disabled', awgCfg.disabled),
+				numField(_('Max latency (ms)'), 'gs-awg-lat', awgCfg.max_latency || 500, _('degraded above')),
+				numField(_('Max loss (%)'), 'gs-awg-loss', awgCfg.max_loss || 10, _('degraded above')),
+				numField(_('Fail count to down'), 'gs-awg-fail', awgCfg.max_fail || 3, _('consecutive fails')),
+				numField(_('Success count to up'), 'gs-awg-succ', awgCfg.min_success || 6, _('consecutive successes')),
+				numField(_('Ping count'), 'gs-awg-ping', awgCfg.ping_count || 5, _('pings per check')),
+				E('div', { 'class': 'cbi-value', 'style': 'margin-bottom:6px' }, [
+					E('label', { 'class': 'cbi-value-title', 'style': 'width:220px;display:inline-block;font-size:13px' }, _('Tunnel targets')),
+					E('div', { 'class': 'cbi-value-field', 'style': 'display:inline-block' }, [
+						E('input', { 'id': 'gs-awg-targets', 'type': 'text', 'class': 'cbi-input-text', 'value': targets, 'style': 'width:200px' }),
+						E('span', { 'style': 'margin-left:8px;font-size:11px;color:#999' }, _('comma separated IPs'))
+					])
+				])
+			]);
+		}
+
+		function renderSingboxTab() {
+			return E('div', {}, [
+				disabledToggle('gs-sb-disabled', sbCfg.disabled),
+				E('div', { 'style': 'padding:8px 12px;background:#f0f4f8;border-radius:4px;margin-bottom:12px;font-size:12px;color:#555' },
+					_('SingBox nodes are checked via Clash API. Each node runs a delay test to the URL below.')),
+				numField(_('Max latency (ms)'), 'gs-sb-lat', sbCfg.max_latency || 2000, _('degraded above')),
+				numField(_('Fail count to down'), 'gs-sb-fail', sbCfg.max_fail || 3, _('consecutive fails')),
+				numField(_('Success count to up'), 'gs-sb-succ', sbCfg.min_success || 3, _('consecutive successes')),
+				E('div', { 'class': 'cbi-value', 'style': 'margin-bottom:6px' }, [
+					E('label', { 'class': 'cbi-value-title', 'style': 'width:220px;display:inline-block;font-size:13px' }, _('Delay test URL')),
+					E('div', { 'class': 'cbi-value-field', 'style': 'display:inline-block' }, [
+						E('input', { 'id': 'gs-sb-url', 'type': 'text', 'class': 'cbi-input-text', 'value': sbCfg.ip_check_url || 'http://cp.cloudflare.com', 'style': 'width:220px' }),
+						E('span', { 'style': 'margin-left:8px;font-size:11px;color:#999' }, _('tested via Clash API'))
+					])
+				]),
+				E('div', { 'class': 'cbi-value', 'style': 'margin-bottom:6px' }, [
+					E('label', { 'class': 'cbi-value-title', 'style': 'width:220px;display:inline-block;font-size:13px' }, _('Delay timeout (ms)')),
+					E('div', { 'class': 'cbi-value-field', 'style': 'display:inline-block' }, [
+						E('input', { 'id': 'gs-sb-timeout', 'type': 'text', 'class': 'cbi-input-text', 'value': String(sbCfg.delay_timeout || 5000), 'style': 'width:90px' })
+					])
+				])
+			]);
+		}
+
+		function renderLogsTab() {
+			var logDiv = E('div', { 'style': 'font-family:monospace;font-size:12px;background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:4px;max-height:280px;overflow-y:auto;white-space:pre-wrap;word-break:break-all' }, _('Loading...'));
+			var typeSelect = E('select', { 'class': 'cbi-input-select', 'style': 'margin-right:8px' }, [
+				E('option', { 'value': 'awg' }, 'AWG healthcheck'),
+				E('option', { 'value': 'singbox' }, 'SingBox healthcheck')
+			]);
+			var refreshBtn = E('button', { 'class': 'btn cbi-button', 'style': 'margin-bottom:8px',
+				'click': function() {
+					var cmd = typeSelect.value === 'singbox' ? 'get_hc_logs_singbox' : 'get_hc_logs';
+					logDiv.textContent = _('Loading...');
+					fs.exec('/usr/bin/awg-manager-backend', [cmd]).then(function(r) {
+						logDiv.textContent = (r.stdout || '').trim() || _('No logs');
+						logDiv.scrollTop = logDiv.scrollHeight;
+					});
+				}
+			}, '\u21bb ' + _('Refresh'));
+			setTimeout(function() {
+				fs.exec('/usr/bin/awg-manager-backend', ['get_hc_logs']).then(function(r) {
+					logDiv.textContent = (r.stdout || '').trim() || _('No logs');
+					logDiv.scrollTop = logDiv.scrollHeight;
+				});
+			}, 50);
+			return E('div', {}, [ E('div', { 'style': 'margin-bottom:8px' }, [ typeSelect, refreshBtn ]), logDiv ]);
+		}
+
+		function renderContent() {
+			contentDiv.innerHTML = '';
+			if (activeTab === 'awg') contentDiv.appendChild(renderAwgTab());
+			else if (activeTab === 'singbox') contentDiv.appendChild(renderSingboxTab());
+			else contentDiv.appendChild(renderLogsTab());
+		}
+		renderContent();
+
+		function saveSettings() {
+			if (activeTab === 'awg') {
+				var tgts = (document.getElementById('gs-awg-targets').value || '8.8.8.8,9.9.9.9')
+					.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+				awgCfg = {
+					disabled: document.getElementById('gs-awg-disabled').checked,
+					max_latency: parseInt(document.getElementById('gs-awg-lat').value) || 500,
+					max_loss: parseInt(document.getElementById('gs-awg-loss').value) || 10,
+					max_fail: parseInt(document.getElementById('gs-awg-fail').value) || 3,
+					min_success: parseInt(document.getElementById('gs-awg-succ').value) || 6,
+					ping_count: parseInt(document.getElementById('gs-awg-ping').value) || 5,
+					tunnel_targets: tgts
+				};
+				fs.exec('/usr/bin/awg-manager-backend', ['save_hc_config', JSON.stringify(awgCfg)]).then(function() {
+					ui.hideModal(); self.showMsg('success', _('AWG healthcheck settings saved'));
+				});
+			} else if (activeTab === 'singbox') {
+				sbCfg = {
+					disabled: document.getElementById('gs-sb-disabled').checked,
+					max_latency: parseInt(document.getElementById('gs-sb-lat').value) || 2000,
+					max_fail: parseInt(document.getElementById('gs-sb-fail').value) || 3,
+					min_success: parseInt(document.getElementById('gs-sb-succ').value) || 3,
+					ip_check_url: document.getElementById('gs-sb-url').value.trim() || 'http://cp.cloudflare.com',
+					delay_timeout: parseInt(document.getElementById('gs-sb-timeout').value) || 5000
+				};
+				fs.exec('/usr/bin/awg-manager-backend', ['save_hc_singbox_config', JSON.stringify(sbCfg)]).then(function() {
+					ui.hideModal(); self.showMsg('success', _('SingBox healthcheck settings saved'));
+				});
+			} else {
+				ui.hideModal();
+			}
+		}
+
+		ui.showModal(_('Global Settings'), [
+			E('div', { 'style': 'display:flex;gap:0;border-bottom:1px solid #ddd' }, [
+				tabBtn('awg', '\ud83d\udee1 AWG'),
+				tabBtn('singbox', '\ud83d\udce6 SingBox'),
+				tabBtn('logs', '\ud83d\udccb ' + _('Logs'))
+			]),
+			contentDiv,
+			E('div', { 'style': 'display:flex;justify-content:flex-end;gap:8px;margin-top:16px' }, [
+				E('button', { 'class': 'btn cbi-button', 'click': function() { ui.hideModal(); } }, _('Close')),
+				E('button', { 'class': 'btn cbi-button cbi-button-apply', 'click': saveSettings }, _('Save'))
+			])
+		]);
+	},
+
 	showAddressLists: function() {
 		var self = this;
 		fs.exec('/usr/bin/awg-manager-backend', ['get_lists']).then(function(r) {
@@ -649,6 +1045,115 @@ return view.extend({
 				}}, _('Save'))
 			])
 		]);
+	},
+
+	renderDiagTab: function(serverName) {
+		var self = this;
+		var container = E('div', { 'style': 'padding:8px' });
+
+		var runBtn = E('button', { 'class': 'btn cbi-button cbi-button-apply',
+			'click': function() {
+				runBtn.disabled = true;
+				runBtn.textContent = _('Running...');
+				container.innerHTML = '';
+				container.appendChild(runBtn);
+
+				// Just read current diagnostics + healthcheck status, no run
+				fs.exec('/usr/bin/awg-manager-backend', ['get_diagnostics', serverName]).then(function(r) {
+					var d = {};
+					try { d = JSON.parse(r.stdout); } catch(e) {}
+
+					function badge(ok, text) {
+						return E('span', {
+							'style': 'padding:2px 8px;border-radius:3px;font-size:12px;font-weight:bold;background:' +
+								(ok ? '#dff0d8' : '#f2dede') + ';color:' + (ok ? '#3c763d' : '#a94442')
+						}, ok ? '✓ ' + text : '✗ ' + text);
+					}
+
+					var rows = [];
+
+					// Mode
+					var modeOk = d.mode !== 'none';
+					var modeText = d.mode === 'none' ? _('None (via WAN)') :
+						d.mode === 'cascade' ? 'Cascade → ' + d.mode_detail :
+						d.mode + ' → ' + d.mode_detail;
+					rows.push(E('tr', { 'class': 'tr' }, [
+						E('td', { 'class': 'td left', 'width': '35%' }, _('Routing mode')),
+						E('td', { 'class': 'td' }, [ badge(modeOk || d.mode === 'none', modeText) ])
+					]));
+
+					// Table
+					if (d.mode !== 'none') {
+						rows.push(E('tr', { 'class': 'tr' }, [
+							E('td', { 'class': 'td left' }, _('Routing table')),
+							E('td', { 'class': 'td' }, [
+								badge(d.table_ok === true || d.table_ok === 'true', 'table ' + (d.table || '?')),
+								d.table_content ? E('div', { 'style': 'font-size:11px;color:#666;margin-top:2px;font-family:monospace' }, d.table_content) : E('span')
+							])
+						]));
+
+						// IP rules - just status, no details
+						rows.push(E('tr', { 'class': 'tr' }, [
+							E('td', { 'class': 'td left' }, 'IP rules'),
+							E('td', { 'class': 'td' }, [
+								badge(d.rules_ok === true || d.rules_ok === 'true',
+									d.rules_ok === true || d.rules_ok === 'true' ? _('Applied') : _('Missing'))
+							])
+						]));
+					}
+
+					// Exit nodes - from healthcheck + mode_detail for missing ones
+					var allNodes = {};
+					if (d.nodes) Object.keys(d.nodes).forEach(function(k){ allNodes[k] = d.nodes[k]; });
+					if (d.mode_detail) {
+						d.mode_detail.split(',').forEach(function(n) {
+							n = n.trim();
+							if (n && !allNodes[n]) allNodes[n] = { status: 'unknown', latency: 0 };
+						});
+					}
+					Object.keys(allNodes).forEach(function(node) {
+						var info = allNodes[node];
+						var status = typeof info === 'object' ? info.status : info;
+						var latency = typeof info === 'object' ? info.latency : 0;
+						var loss = typeof info === 'object' ? (info.loss || 0) : 0;
+						var latencyText = latency > 0 ? latency + 'ms' : '';
+						var lossText = loss > 0 ? ' ' + loss + '% loss' : '';
+						var detailText = (latencyText || lossText) ? ' (' + latencyText + lossText + ')' : '';
+						rows.push(E('tr', { 'class': 'tr' }, [
+							E('td', { 'class': 'td left' }, _('Exit node: ') + node),
+							E('td', { 'class': 'td' }, [
+								status === 'unknown' ?
+									E('span', { 'style': 'padding:2px 8px;border-radius:3px;font-size:12px;background:#f5f5f5;color:#999' }, '? ' + _('Checking...')) :
+								status === 'degraded' ?
+									E('span', { 'style': 'padding:2px 8px;border-radius:3px;font-size:12px;font-weight:bold;background:#fcf8e3;color:#8a6d3b' }, '⚠ ' + _('Degraded') + detailText) :
+									badge(status === 'up', status === 'up' ? _('Online') + detailText : _('Offline'))
+							])
+						]));
+					});
+
+					// Policy rules
+					rows.push(E('tr', { 'class': 'tr' }, [
+						E('td', { 'class': 'td left' }, _('Policy rules')),
+						E('td', { 'class': 'td' }, d.policy_rules + ' ' + _('active'))
+					]));
+
+					container.innerHTML = '';
+					container.appendChild(runBtn);
+					container.appendChild(E('table', { 'class': 'table', 'style': 'margin-top:12px' }, rows));
+					runBtn.disabled = false;
+					runBtn.textContent = _('Run diagnostics');
+				}).catch(function(e) {
+					container.innerHTML = '';
+					container.appendChild(runBtn);
+					container.appendChild(E('p', { 'style': 'color:#a94442' }, _('Error: ') + e));
+					runBtn.disabled = false;
+					runBtn.textContent = _('Run diagnostics');
+				});
+			}
+		}, _('Run diagnostics'));
+
+		container.appendChild(runBtn);
+		return container;
 	},
 
 	showCreateServerForm: function() {

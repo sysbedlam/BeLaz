@@ -1,6 +1,6 @@
 {
 	"luci-app-awg-manager": {
-		"description": "Grant access to AmneziaWG Manager",
+		"description": "Grant access to BeLaz Manager",
 		"read": {
 			"file": {
 				"/etc/awg-manager": [ "list" ],
@@ -9,16 +9,23 @@
 				"/etc/awg-manager/servers/*": [ "read", "list" ],
 				"/etc/awg-manager/servers/*/*": [ "read", "list" ],
 				"/etc/awg-manager/servers/*/clients/*": [ "read" ],
-				"/etc/awg-manager/stats/*": [ "read" ],
 				"/usr/bin/awg-manager-backend": [ "exec" ],
-				"/usr/bin/awg-manager-backend *": [ "exec" ]
+				"/usr/bin/awg-manager-backend *": [ "exec" ],
+				"/usr/bin/awg-healthcheck": [ "exec" ],
+				"/usr/bin/awg-routing": [ "exec" ],
+				"/usr/bin/awg-routing *": [ "exec" ]
 			}
 		},
 		"write": {
 			"file": {
 				"/etc/awg-manager/servers/*/clients/*": [ "write" ],
+				"/etc/awg-manager/routing.json": [ "write" ],
+				"/etc/awg-manager/address-lists.json": [ "write" ],
 				"/usr/bin/awg-manager-backend": [ "exec" ],
-				"/usr/bin/awg-manager-backend *": [ "exec" ]
+				"/usr/bin/awg-manager-backend *": [ "exec" ],
+				"/usr/bin/awg-healthcheck": [ "exec" ],
+				"/usr/bin/awg-routing": [ "exec" ],
+				"/usr/bin/awg-routing *": [ "exec" ]
 			}
 		}
 	}

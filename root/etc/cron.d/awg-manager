@@ -1,3 +1,0 @@
-*/5 * * * * root /usr/bin/awg-stats-collect
-* * * * * root /usr/bin/awg-healthcheck
-* * * * * root sleep 30 && /usr/bin/awg-healthcheck

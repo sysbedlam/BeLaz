@@ -2,7 +2,7 @@
 # awg-manager-backend v2.1
 
 AWG_BASE="/etc/awg-manager/servers"
-STATS_DIR="/etc/awg-manager/stats"
+
 DNS_I1='<r 2><b 0x8580000100010000000004796162730679616e6465780272750000010001c00c000100010000026d000457fa27d1>'
 
 random_int() {
@@ -202,6 +202,28 @@ create_server() {
     fi
 
     mkdir -p "$AWG_BASE/$IFACE/clients"
+
+    # Assign unique server index for routing tables
+    local SERVER_INDEX=0
+    local INDEXES_FILE="/etc/awg-manager/indexes.json"
+    [ -f "$INDEXES_FILE" ] || echo '{}' > "$INDEXES_FILE"
+
+    # Check if this interface already has an index
+    local existing_index=$(grep -o "\"$IFACE\":[0-9]*" "$INDEXES_FILE" | cut -d: -f2)
+    if [ -n "$existing_index" ]; then
+        SERVER_INDEX=$existing_index
+    else
+        local i=0
+        while [ $i -le 39 ]; do
+            grep -q ":$i[,}]" "$INDEXES_FILE" 2>/dev/null || { SERVER_INDEX=$i; break; }
+            i=$((i+1))
+        done
+        # Register index
+        local json=$(cat "$INDEXES_FILE")
+        local new=$(echo "$json" | sed "s/}$/,\"$IFACE\":$SERVER_INDEX}/;s/^{,/{/")
+        echo "$new" > "$INDEXES_FILE"
+    fi
+
     cat > "$AWG_BASE/$IFACE/server.conf" << EOF
 SERVER_PUB_KEY=$PUB_KEY
 SERVER_PRIV_KEY=$PRIV_KEY
@@ -210,6 +232,7 @@ SERVER_IP=$SERVER_IP
 SERVER_EXT_IP=$EXT_IP
 SUBNET_BASE=$SUBNET
 VERSION=$VERSION
+SERVER_INDEX=$SERVER_INDEX
 JC=$JC
 JMIN=$JMIN
 JMAX=$JMAX
@@ -230,9 +253,123 @@ EOF
     sleep 2
     ifdown $IFACE > /dev/null 2>&1
     ifup $IFACE > /dev/null 2>&1
+    sleep 1
+    /usr/bin/awg-routing apply
 }
 
 # ─── DELETE SERVER ──────────────────────────────────────────
+clean_routing_for_server() {
+    local IFACE=$1
+    [ -f "$ROUTING_FILE" ] || return
+
+    # Use awk to rebuild routing.json properly
+    awk -v iface="$IFACE" '
+    BEGIN { RS=""; FS="\n" }
+    {
+        # Work with the whole JSON as a string
+        json = $0
+
+        # Remove cascade entries where from or to = iface
+        while (match(json, /\{"from":"[^"]*","to":"[^"]*"\}/)) {
+            entry = substr(json, RSTART, RLENGTH)
+            if (entry ~ "\"from\":\"" iface "\"" || entry ~ "\"to\":\"" iface "\"") {
+                # Remove this cascade including surrounding comma
+                before = substr(json, 1, RSTART-1)
+                after = substr(json, RSTART+RLENGTH)
+                gsub(/,$/, "", before)
+                gsub(/^,/, "", after)
+                json = before after
+            } else {
+                break
+            }
+        }
+
+        # Remove iface from balancer nodes
+        # Pattern: {"iface":"NAME","weight":N}
+        pattern = "{\"iface\":\"" iface "\",\"weight\":[0-9]+}"
+        while (match(json, pattern)) {
+            before = substr(json, 1, RSTART-1)
+            after = substr(json, RSTART+RLENGTH)
+            # Remove surrounding commas
+            sub(/,$/, "", before)
+            sub(/^,/, "", after)
+            json = before after
+        }
+
+        # Remove empty balancers (nodes array is empty [])
+        while (match(json, /\{"name":"[^"]*","from":"[^"]*","mode":"[^"]*","nodes":\[\]\}/)) {
+            before = substr(json, 1, RSTART-1)
+            after = substr(json, RSTART+RLENGTH)
+            sub(/,$/, "", before)
+            sub(/^,/, "", after)
+            json = before after
+        }
+
+        # Remove balancers where from = iface
+        while (match(json, /\{"name":"[^"]*","from":"/) ) {
+            entry_start = RSTART
+            # Find matching closing brace after "nodes":[...]
+            depth = 0
+            found = 0
+            for (i = entry_start; i <= length(json); i++) {
+                c = substr(json, i, 1)
+                if (c == "{") depth++
+                else if (c == "}") { depth--; if (depth == 0) { found = i; break } }
+            }
+            if (!found) break
+            entry = substr(json, entry_start, found - entry_start + 1)
+            if (entry ~ "\"from\":\"" iface "\"") {
+                before = substr(json, 1, entry_start - 1)
+                after = substr(json, found + 1)
+                sub(/,$/, "", before)
+                sub(/^,/, "", after)
+                json = before after
+            } else {
+                break
+            }
+        }
+
+        # Remove rules where from = iface or exit = iface
+        while (match(json, /\{"from":"[^"]*","list":"[^"]*","action":"[^"]*","exit":"[^"]*"\}/)) {
+            entry = substr(json, RSTART, RLENGTH)
+            if (entry ~ "\"from\":\"" iface "\"" || entry ~ "\"exit\":\"" iface "\"") {
+                before = substr(json, 1, RSTART-1)
+                after = substr(json, RSTART+RLENGTH)
+                sub(/,$/, "", before)
+                sub(/^,/, "", after)
+                json = before after
+            } else {
+                break
+            }
+        }
+
+        # Cleanup
+        gsub(/,]/, "]", json)
+        gsub(/\[,/, "[", json)
+        gsub(/,,/, ",", json)
+
+        print json
+    }
+    ' "$ROUTING_FILE" > /tmp/awg_routing_new.json && mv /tmp/awg_routing_new.json "$ROUTING_FILE"
+}
+
+clean_healthcheck_for_node() {
+    local IFACE=$1
+    # Clean healthcheck.json
+    if [ -f "/etc/awg-manager/healthcheck.json" ]; then
+        sed -i "s/,\"$IFACE\":{[^}]*}//g" /etc/awg-manager/healthcheck.json
+        sed -i "s/\"$IFACE\":{[^}]*},//g" /etc/awg-manager/healthcheck.json
+        sed -i "s/\"$IFACE\":{[^}]*}//g" /etc/awg-manager/healthcheck.json
+        sed -i 's/,,/,/g;s/{,/{/g;s/,}/}/g' /etc/awg-manager/healthcheck.json
+    fi
+    # Clean healthcheck_history.json
+    if [ -f "/etc/awg-manager/healthcheck_history.json" ]; then
+        sed -i "s/,\"${IFACE}_[^\"]*\":[0-9]*//g" /etc/awg-manager/healthcheck_history.json
+        sed -i "s/\"${IFACE}_[^\"]*\":[0-9]*,//g" /etc/awg-manager/healthcheck_history.json
+        sed -i "s/\"${IFACE}_[^\"]*\":[0-9]*//g" /etc/awg-manager/healthcheck_history.json
+        sed -i 's/,,/,/g;s/{,/{/g;s/,}/}/g' /etc/awg-manager/healthcheck_history.json
+    fi
+}
 delete_server() {
     local IFACE=$1
     [ -z "$IFACE" ] && exit 1
@@ -254,8 +391,14 @@ delete_server() {
     uci commit firewall
     rm -rf "$AWG_BASE/$IFACE"
     rm -f "$STATS_DIR/$IFACE.json"
+    # Clean routing rules, healthcheck data
+    clean_routing_for_server "$IFACE"
+    clean_healthcheck_for_node "$IFACE"
+    /usr/bin/awg-routing delete "$IFACE"
     service network restart > /dev/null 2>&1
     service firewall restart > /dev/null 2>&1
+    sleep 2
+    /usr/bin/awg-routing apply
 }
 
 # ─── ADD CLIENT ─────────────────────────────────────────────
@@ -412,81 +555,6 @@ peers_stats() {
     printf '}\n'
 }
 
-# ─── ACCUMULATE STATS ───────────────────────────────────────
-accumulate_stats() {
-    local IFACE=$1
-    [ -z "$IFACE" ] && exit 1
-    mkdir -p "$STATS_DIR"
-    local STATS_FILE="$STATS_DIR/$IFACE.json"
-    local CLIENTS_DIR="$AWG_BASE/$IFACE/clients"
-    local AWG_OUTPUT=$(awg show $IFACE dump 2>/dev/null)
-    local NOW=$(date +%s)
-    local MONTH=$(date +%Y-%m)
-
-    printf '{' > /tmp/awg_stats_new.json
-    local first=1
-    for f in "$CLIENTS_DIR"/*.conf; do
-        [ -f "$f" ] || continue
-        local name=$(basename "$f" .conf)
-        local peer_id="${IFACE}_peer_$(echo $name | tr -cd 'a-zA-Z0-9_')"
-        local pub=$(uci get network.$peer_id.public_key 2>/dev/null)
-        [ -z "$pub" ] && continue
-        local line=$(echo "$AWG_OUTPUT" | grep "^$pub	")
-        local cur_rx=0 cur_tx=0
-        [ -n "$line" ] && \
-            cur_rx=$(echo "$line" | awk '{print $6}') && \
-            cur_tx=$(echo "$line" | awk '{print $7}')
-
-        # Read previous snapshot and accumulated
-        local prev_rx=0 prev_tx=0 acc_rx=0 acc_tx=0 acc_month=""
-        if [ -f "$STATS_FILE" ]; then
-            local entry=$(grep -o "\"$name\":{[^}]*}" "$STATS_FILE" 2>/dev/null)
-            prev_rx=$(echo "$entry" | grep -o '"prev_rx":"[0-9]*"' | grep -o '[0-9]*')
-            prev_tx=$(echo "$entry" | grep -o '"prev_tx":"[0-9]*"' | grep -o '[0-9]*')
-            acc_rx=$(echo "$entry" | grep -o '"acc_rx":"[0-9]*"' | grep -o '[0-9]*')
-            acc_tx=$(echo "$entry" | grep -o '"acc_tx":"[0-9]*"' | grep -o '[0-9]*')
-            acc_month=$(echo "$entry" | grep -o '"month":"[^"]*"' | grep -o '[0-9-]*')
-        fi
-        [ -z "$prev_rx" ] && prev_rx=0
-        [ -z "$prev_tx" ] && prev_tx=0
-        [ -z "$acc_rx" ] && acc_rx=0
-        [ -z "$acc_tx" ] && acc_tx=0
-
-        # Reset on new month
-        [ "$acc_month" != "$MONTH" ] && acc_rx=0 && acc_tx=0
-
-        # Calculate delta (handle session resets)
-        local delta_rx=0 delta_tx=0
-        if [ "$cur_rx" -ge "$prev_rx" ] 2>/dev/null; then
-            delta_rx=$((cur_rx - prev_rx))
-        else
-            delta_rx=$cur_rx
-        fi
-        if [ "$cur_tx" -ge "$prev_tx" ] 2>/dev/null; then
-            delta_tx=$((cur_tx - prev_tx))
-        else
-            delta_tx=$cur_tx
-        fi
-
-        acc_rx=$((acc_rx + delta_rx))
-        acc_tx=$((acc_tx + delta_tx))
-
-        [ $first -eq 1 ] && first=0 || printf ',' >> /tmp/awg_stats_new.json
-        printf '"%s":{"acc_rx":"%s","acc_tx":"%s","prev_rx":"%s","prev_tx":"%s","month":"%s","updated":"%s"}' \
-            "$name" "$acc_rx" "$acc_tx" "$cur_rx" "$cur_tx" "$MONTH" "$NOW" \
-            >> /tmp/awg_stats_new.json
-    done
-    printf '}' >> /tmp/awg_stats_new.json
-    mv /tmp/awg_stats_new.json "$STATS_FILE"
-}
-
-# ─── MONTHLY STATS ──────────────────────────────────────────
-monthly_stats() {
-    local IFACE=$1
-    local STATS_FILE="$STATS_DIR/$IFACE.json"
-    [ -f "$STATS_FILE" ] && cat "$STATS_FILE" || printf '{}\n'
-}
-
 # ─── ADDRESS LISTS ──────────────────────────────────────────
 LISTS_FILE="/etc/awg-manager/address-lists.json"
 
@@ -535,6 +603,8 @@ save_list() {
     [ "$content" = "[" ] && printf '{"name":"%s","cidrs":%s}' "$name" "$arr" >> "$LISTS_FILE" \
                          || printf ',{"name":"%s","cidrs":%s}' "$name" "$arr" >> "$LISTS_FILE"
     printf ']' >> "$LISTS_FILE"
+    # Sync nftables set
+    /usr/bin/awg-routing sync_list "$name" 2>/dev/null
 }
 
 delete_list() {
@@ -569,6 +639,48 @@ get_healthcheck() {
         cat "/etc/awg-manager/healthcheck.json" || echo '{}'
 }
 
+HC_CONFIG_FILE="/etc/awg-manager/healthcheck_config.json"
+
+get_hc_config() {
+    if [ -f "$HC_CONFIG_FILE" ]; then
+        cat "$HC_CONFIG_FILE"
+    else
+        echo '{"disabled":false,"max_latency":500,"max_loss":10,"min_success":6,"max_fail":3,"ping_count":5,"tunnel_targets":["8.8.8.8","9.9.9.9"]}'
+    fi
+}
+
+save_hc_config() {
+    local json=$1
+    mkdir -p /etc/awg-manager
+    echo "$json" > "$HC_CONFIG_FILE"
+    echo 'ok'
+}
+
+get_hc_logs() {
+    logread 2>/dev/null | grep "awg-healthcheck" | tail -200
+}
+
+HC_SINGBOX_CONFIG_FILE="/etc/awg-manager/healthcheck_singbox_config.json"
+
+get_hc_singbox_config() {
+    if [ -f "$HC_SINGBOX_CONFIG_FILE" ]; then
+        cat "$HC_SINGBOX_CONFIG_FILE"
+    else
+        echo '{"disabled":false,"check_external_ip":true,"check_availability":true,"check_latency":true,"max_latency":2000,"max_loss":20,"min_success":3,"max_fail":3,"ip_check_url":"http://ifconfig.me"}'
+    fi
+}
+
+save_hc_singbox_config() {
+    local json=$1
+    mkdir -p /etc/awg-manager
+    echo "$json" > "$HC_SINGBOX_CONFIG_FILE"
+    echo 'ok'
+}
+
+get_hc_logs_singbox() {
+    logread 2>/dev/null | grep "singbox-healthcheck" | tail -200
+}
+
 get_interfaces() {
     printf '['
     local first=1
@@ -581,7 +693,29 @@ get_interfaces() {
         [ $first -eq 1 ] && first=0 || printf ','
         printf '{"name":"%s","type":"awg"}' "$name"
     done
-    # System interfaces — skip lo and already listed AWG ones
+    # SingBox exit nodes
+    if [ -f "$EXITNODES_FILE" ]; then
+        for entry in $(grep -o '"[^"]*":{"type":"singbox"[^}]*}' "$EXITNODES_FILE" 2>/dev/null); do
+            local name=$(echo "$entry" | cut -d'"' -f2)
+            [ -z "$name" ] && continue
+            echo "$listed" | grep -qw "$name" && continue
+            listed="$listed $name"
+            [ $first -eq 1 ] && first=0 || printf ','
+            printf '{"name":"%s","type":"singbox"}' "$name"
+        done
+    fi
+    # AWG exit nodes (registered but not AWG servers)
+    if [ -f "$EXITNODES_FILE" ]; then
+        for entry in $(grep -o '"[^"]*":{"type":"awg"[^}]*}' "$EXITNODES_FILE" 2>/dev/null); do
+            local name=$(echo "$entry" | cut -d'"' -f2)
+            [ -z "$name" ] && continue
+            echo "$listed" | grep -qw "$name" && continue
+            listed="$listed $name"
+            [ $first -eq 1 ] && first=0 || printf ','
+            printf '{"name":"%s","type":"awg"}' "$name"
+        done
+    fi
+    # System interfaces — skip lo and already listed
     for iface in $(ip link show | grep -oE '^[0-9]+: [a-zA-Z0-9_@]+' | awk '{print $2}' | tr -d '@' | grep -v '^lo$'); do
         echo "$listed" | grep -qw "$iface" && continue
         [ $first -eq 1 ] && first=0 || printf ','
@@ -596,6 +730,487 @@ save_routing() {
     /usr/bin/awg-routing apply
 }
 
+get_diagnostics() {
+    local server=$1
+    local routing=$(cat "$ROUTING_FILE" 2>/dev/null || echo '{}')
+    local health=$(cat "/etc/awg-manager/healthcheck.json" 2>/dev/null || echo '{}')
+
+    # Get server index
+    local index=0
+    [ -f "/etc/awg-manager/indexes.json" ] && \
+        index=$(grep -o "\"$server\":[0-9]*" /etc/awg-manager/indexes.json | cut -d: -f2)
+    [ -z "$index" ] && index=0
+
+    local cascade=$(echo "$routing" | grep -o "\"from\":\"$server\",\"to\":\"[^\"]*\"" | head -1)
+    local balancer=$(echo "$routing" | grep -o "\"from\":\"$server\",\"mode\":\"[^\"]*\"" | head -1)
+    local mode="none"
+    local mode_detail=""
+
+    if [ -n "$cascade" ]; then
+        mode="cascade"
+        mode_detail=$(echo "$cascade" | grep -o '"to":"[^"]*"' | cut -d'"' -f4)
+        table=$((100 + index))
+    elif [ -n "$balancer" ]; then
+        mode=$(echo "$balancer" | grep -o '"mode":"[^"]*"' | cut -d'"' -f4)
+        mode_detail=$(echo "$routing" | grep -o "\"from\":\"$server\"[^]]*\"nodes\":\[[^]]*\]" | grep -oE '"iface":"[^"]*"' | cut -d'"' -f4 | tr '\n' ',' | sed 's/,$//')
+        table=$((140 + index))
+    fi
+
+    local table_ok="false"
+    local table_content=""
+    if [ -n "$table" ]; then
+        table_content=$(ip route show table $table 2>/dev/null | sed 's/	/ /g;s/  */ /g' | tr '\n' ' ' | tr -d '"')
+        [ -n "$table_content" ] && table_ok="true"
+    fi
+
+    local rules_ok="false"
+    local rules=$(ip rule show 2>/dev/null | grep "iif $server" | sed 's/^[0-9]*://;s/	/ /g;s/  */ /g' | tr '\n' '|' | sed 's/|$//' | tr -d '"')
+    [ -n "$rules" ] && rules_ok="true"
+
+    printf '{'
+    printf '"mode":"%s","mode_detail":"%s",' "$mode" "$mode_detail"
+    printf '"table":"%s","table_ok":%s,"table_content":"%s",' "${table:-?}" "$table_ok" "$table_content"
+    printf '"rules_ok":%s,"rules":"%s",' "$rules_ok" "$rules"
+
+    # Exit nodes
+    printf '"nodes":{'
+    echo "$routing" | grep -o "\"from\":\"$server\"[^]]*\"nodes\":\[[^]]*\]" | grep -oE '"iface":"[^"]*"' | cut -d'"' -f4 > /tmp/awg_diag_nodes.tmp
+    echo "$routing" | grep -o "\"from\":\"$server\",\"to\":\"[^\"]*\"" | grep -o '"to":"[^"]*"' | cut -d'"' -f4 >> /tmp/awg_diag_nodes.tmp
+    echo "$routing" | grep -o "\"from\":\"$server\",[^}]*\"exit\":\"[^\"]*\"" | grep -o '"exit":"[^"]*"' | cut -d'"' -f4 >> /tmp/awg_diag_nodes.tmp
+
+    local nfirst=1
+    sort -u /tmp/awg_diag_nodes.tmp | while read node; do
+        [ -z "$node" ] && continue
+        local nstatus=$(echo "$health" | grep -o "\"$node\":{\"status\":\"[^\"]*\"" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+        local nlatency=$(echo "$health" | grep -o "\"$node\":{[^}]*}" | grep -o '"latency":[0-9-]*' | cut -d: -f2)
+        local nloss=$(echo "$health" | grep -o "\"$node\":{[^}]*}" | grep -o '"loss":[0-9]*' | cut -d: -f2)
+        [ -z "$nstatus" ] && nstatus="unknown"
+        [ -z "$nlatency" ] && nlatency=0
+        [ -z "$nloss" ] && nloss=0
+        [ $nfirst -eq 1 ] && nfirst=0 || printf ','
+        printf '"%s":{"status":"%s","latency":%s,"loss":%s}' "$node" "$nstatus" "$nlatency" "$nloss"
+    done
+    rm -f /tmp/awg_diag_nodes.tmp
+    printf '},'
+
+    local policy_count=$(echo "$routing" | grep -o "\"from\":\"$server\"" | wc -l)
+    [ -n "$cascade" ] && policy_count=$((policy_count - 1))
+    [ -n "$balancer" ] && policy_count=$((policy_count - 1))
+    [ $policy_count -lt 0 ] && policy_count=0
+    printf '"policy_rules":%s' "$policy_count"
+    printf '}\n'
+}
+
+# ─── EXIT NODES ─────────────────────────────────────────────
+EXITNODES_FILE="/etc/awg-manager/exitnodes.json"
+SINGBOX_CONF_DIR="/etc/sing-box"
+
+init_exitnodes() {
+    [ -f "$EXITNODES_FILE" ] || echo '{}' > "$EXITNODES_FILE"
+    mkdir -p "$SINGBOX_CONF_DIR"
+}
+
+get_exitnodes() {
+    init_exitnodes
+    local registered=$(cat "$EXITNODES_FILE")
+
+    # Get all WAN zone networks
+    local wan_nets=""
+    local idx=0
+    while uci get firewall.@zone[$idx] > /dev/null 2>&1; do
+        if [ "$(uci get firewall.@zone[$idx].name 2>/dev/null)" = "wan" ]; then
+            wan_nets=$(uci get firewall.@zone[$idx].network 2>/dev/null)
+            break
+        fi
+        idx=$((idx+1))
+    done
+
+    printf '{"nodes":['
+    local first=1
+    local health=""
+    [ -f "/etc/awg-manager/healthcheck.json" ] && health=$(cat /etc/awg-manager/healthcheck.json)
+
+    for iface in $wan_nets; do
+        [ -z "$iface" ] && continue
+
+        # Detect if it's a physical/system interface (eth*, wan*)
+        local is_system=0
+        echo "$iface" | grep -qE '^(eth|wan|br-wan|ens|enp)' && is_system=1
+
+        # Get registered info
+        local reg_entry=$(echo "$registered" | grep -o "\"$iface\":{[^}]*}")
+        local type="awg"
+        local display="$iface"
+        local server=""
+        local protocol=""
+
+        if [ -n "$reg_entry" ]; then
+            type=$(echo "$reg_entry" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
+            display=$(echo "$reg_entry" | grep -o '"display_name":"[^"]*"' | cut -d'"' -f4)
+            server=$(echo "$reg_entry" | grep -o '"server":"[^"]*"' | cut -d'"' -f4)
+            protocol=$(echo "$reg_entry" | grep -o '"protocol":"[^"]*"' | cut -d'"' -f4)
+            [ -z "$display" ] && display="$iface"
+        else
+            [ $is_system -eq 1 ] && type="system"
+        fi
+
+        # Get server address for AWG nodes from UCI
+        if [ "$type" = "awg" ] && [ -z "$server" ]; then
+            server=$(uci show network 2>/dev/null | grep "amneziawg_${iface}\[0\].endpoint_host" | cut -d= -f2 | tr -d "'")
+        fi
+
+        # Get healthcheck status
+        local hc_entry=$(echo "$health" | grep -o "\"$iface\":{[^}]*}")
+        local hc_status=$(echo "$hc_entry" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+        local hc_latency=$(echo "$hc_entry" | grep -o '"latency":[0-9]*' | cut -d: -f2)
+        [ -z "$hc_status" ] && hc_status="unknown"
+        [ -z "$hc_latency" ] && hc_latency=0
+
+        [ $first -eq 1 ] && first=0 || printf ','
+        printf '{"iface":"%s","type":"%s","display_name":"%s","server":"%s","protocol":"%s","system":%s,"status":"%s","latency":%s}' \
+            "$iface" "$type" "$display" "$server" "$protocol" \
+            "$([ $is_system -eq 1 ] && echo true || echo false)" \
+            "$hc_status" "$hc_latency"
+    done
+
+    # Also add registered nodes that might not be in WAN zone yet (e.g. singbox starting)
+    grep -o '"[^"]*":{' "$EXITNODES_FILE" 2>/dev/null | sed 's/"//g;s/:{//g' | while read name; do
+        echo "$wan_nets" | grep -qw "$name" && continue
+        [ -z "$name" ] && continue
+        local reg=$(grep -o "\"$name\":{[^}]*}" "$EXITNODES_FILE")
+        local type=$(echo "$reg" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
+        local server=$(echo "$reg" | grep -o '"server":"[^"]*"' | cut -d'"' -f4)
+        local display=$(echo "$reg" | grep -o '"display_name":"[^"]*"' | cut -d'"' -f4)
+        [ -z "$display" ] && display="$name"
+        [ -z "$type" ] && type="singbox"
+        local hc_e=$(echo "$health" | grep -o "\"$name\":{[^}]*}")
+        local hc_st=$(echo "$hc_e" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+        local hc_lat=$(echo "$hc_e" | grep -o '"latency":[0-9]*' | cut -d: -f2)
+        [ -z "$hc_st" ] && hc_st="unknown"
+        [ -z "$hc_lat" ] && hc_lat=0
+        printf ',{"iface":"%s","type":"%s","display_name":"%s","server":"%s","system":false,"status":"%s","latency":%s}' \
+            "$name" "$type" "$display" "$server" "$hc_st" "$hc_lat"
+    done
+
+    printf ']}'
+}
+
+# Create AWG exit node from .conf file content
+create_awg_exitnode() {
+    local IFACE=$1
+    local CONF=$2   # content of .conf file
+    local DISPLAY=${3:-$IFACE}
+
+    [ -z "$IFACE" ] || [ -z "$CONF" ] && { echo 'error: missing args'; exit 1; }
+    echo "$IFACE" | grep -qE '^[a-zA-Z0-9_]+$' || { echo 'error: invalid name'; exit 1; }
+
+    init_exitnodes
+
+    # Parse .conf fields
+    local priv_key=$(echo "$CONF" | grep -i "^PrivateKey" | head -1 | sed 's/.*=\s*//')
+    local address=$(echo "$CONF" | grep -i "^Address" | head -1 | sed 's/.*=\s*//' | cut -d, -f1 | tr -d ' ')
+    local dns=$(echo "$CONF" | grep -i "^DNS" | head -1 | sed 's/.*=\s*//' | cut -d, -f1 | tr -d ' ')
+    local jc=$(echo "$CONF" | grep -i "^Jc" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local jmin=$(echo "$CONF" | grep -i "^Jmin" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local jmax=$(echo "$CONF" | grep -i "^Jmax" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local s1=$(echo "$CONF" | grep -i "^S1" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local s2=$(echo "$CONF" | grep -i "^S2" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local s3=$(echo "$CONF" | grep -i "^S3" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local s4=$(echo "$CONF" | grep -i "^S4" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local h1=$(echo "$CONF" | grep -i "^H1" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local h2=$(echo "$CONF" | grep -i "^H2" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local h3=$(echo "$CONF" | grep -i "^H3" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local h4=$(echo "$CONF" | grep -i "^H4" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local i1=$(echo "$CONF" | grep -i "^I1" | head -1 | sed 's/.*=\s*//')
+    # Peer section
+    local pub_key=$(echo "$CONF" | grep -i "^PublicKey" | head -1 | sed 's/.*=\s*//')
+    local psk=$(echo "$CONF" | grep -i "^PresharedKey" | head -1 | sed 's/.*=\s*//')
+    local endpoint=$(echo "$CONF" | grep -i "^Endpoint" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+    local ep_host=$(echo "$endpoint" | rev | cut -d: -f2- | rev)
+    local ep_port=$(echo "$endpoint" | rev | cut -d: -f1 | rev)
+    local keepalive=$(echo "$CONF" | grep -i "^PersistentKeepalive" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+
+    [ -z "$priv_key" ] && { echo 'error: no PrivateKey in config'; exit 1; }
+    [ -z "$pub_key" ] && { echo 'error: no PublicKey in config'; exit 1; }
+    [ -z "$ep_host" ] && { echo 'error: no Endpoint in config'; exit 1; }
+
+    # Remove existing UCI interface if any
+    uci delete network.$IFACE 2>/dev/null
+
+    # Create UCI interface
+    uci set network.$IFACE=interface
+    uci set network.$IFACE.proto='amneziawg'
+    uci set network.$IFACE.private_key="$priv_key"
+    [ -n "$address" ] && uci set network.$IFACE.addresses="$address"
+    [ -n "$jc" ]   && uci set network.$IFACE.awg_jc="$jc"
+    [ -n "$jmin" ] && uci set network.$IFACE.awg_jmin="$jmin"
+    [ -n "$jmax" ] && uci set network.$IFACE.awg_jmax="$jmax"
+    [ -n "$s1" ]   && uci set network.$IFACE.awg_s1="$s1"
+    [ -n "$s2" ]   && uci set network.$IFACE.awg_s2="$s2"
+    [ -n "$s3" ]   && uci set network.$IFACE.awg_s3="$s3"
+    [ -n "$s4" ]   && uci set network.$IFACE.awg_s4="$s4"
+    [ -n "$h1" ]   && uci set network.$IFACE.awg_h1="$h1"
+    [ -n "$h2" ]   && uci set network.$IFACE.awg_h2="$h2"
+    [ -n "$h3" ]   && uci set network.$IFACE.awg_h3="$h3"
+    [ -n "$h4" ]   && uci set network.$IFACE.awg_h4="$h4"
+    [ -n "$i1" ]   && uci set network.$IFACE.awg_i1="$i1"
+    uci commit network
+
+    # Add peer
+    local PEER_ID="${IFACE}_peer_exit"
+    uci set network.$PEER_ID=amneziawg_$IFACE
+    uci set network.$PEER_ID.public_key="$pub_key"
+    [ -n "$psk" ]       && uci set network.$PEER_ID.preshared_key="$psk"
+    uci set network.$PEER_ID.allowed_ips="0.0.0.0/0"
+    [ -n "$ep_host" ]   && uci set network.$PEER_ID.endpoint_host="$ep_host"
+    [ -n "$ep_port" ]   && uci set network.$PEER_ID.endpoint_port="$ep_port"
+    [ -n "$keepalive" ] && uci set network.$PEER_ID.persistent_keepalive="$keepalive"
+    uci set network.$PEER_ID.description="exit peer"
+    uci commit network
+
+    # Add to WAN zone
+    local wan_idx=""
+    local widx=0
+    while uci get firewall.@zone[$widx] > /dev/null 2>&1; do
+        if [ "$(uci get firewall.@zone[$widx].name 2>/dev/null)" = "wan" ]; then
+            wan_idx=$widx; break
+        fi
+        widx=$((widx+1))
+    done
+    if [ -n "$wan_idx" ]; then
+        local existing_net=$(uci get firewall.@zone[$wan_idx].network 2>/dev/null)
+        echo "$existing_net" | grep -qw "$IFACE" || \
+            uci set firewall.@zone[$wan_idx].network="$existing_net $IFACE"
+        uci commit firewall
+    fi
+
+    # Register in exitnodes.json
+    local json=$(cat "$EXITNODES_FILE")
+    json=$(echo "$json" | sed "s/,\"$IFACE\":{[^}]*}//g;s/\"$IFACE\":{[^}]*},\?//g;s/,,/,/g;s/{,/{/g;s/,}/}/g")
+    local entry=$(printf '{"type":"awg","display_name":"%s","server":"%s"}' "$DISPLAY" "$ep_host")
+    local new=$(echo "$json" | sed "s/}$/,\"$IFACE\":$entry}/;s/^{,/{/")
+    echo "$new" > "$EXITNODES_FILE"
+
+    # Bring up interface
+    service network restart > /dev/null 2>&1
+    service firewall restart > /dev/null 2>&1
+    sleep 2
+    ifup $IFACE > /dev/null 2>&1
+    sleep 1
+    /usr/bin/awg-routing apply
+
+    echo 'ok'
+}
+
+# Parse vless:// link and create sing-box config
+create_singbox_exitnode() {
+    local IFACE=$1
+    local LINK=$2
+    local DISPLAY=${3:-$IFACE}
+    [ -z "$IFACE" ] || [ -z "$LINK" ] && { echo 'error: missing args'; exit 1; }
+
+    init_exitnodes
+    mkdir -p "$SINGBOX_CONF_DIR"
+
+    # Parse vless://uuid@host:port?params
+    local uuid=$(echo "$LINK" | sed 's|vless://||' | cut -d@ -f1)
+    local hostport=$(echo "$LINK" | sed 's|vless://||' | cut -d@ -f2 | cut -d? -f1)
+    local host=$(echo "$hostport" | cut -d: -f1)
+    local port=$(echo "$hostport" | cut -d: -f2)
+    local params=$(echo "$LINK" | grep -o '?.*' | tr '&' '\n')
+
+    local security=$(echo "$params" | grep '^security=' | cut -d= -f2 | cut -d'#' -f1)
+    local sni=$(echo "$params" | grep '^sni=' | cut -d= -f2 | cut -d'#' -f1)
+    local fp=$(echo "$params" | grep '^fp=' | cut -d= -f2 | cut -d'#' -f1)
+    local pbk=$(echo "$params" | grep '^pbk=' | cut -d= -f2 | cut -d'#' -f1)
+    local sid=$(echo "$params" | grep '^sid=' | cut -d= -f2 | cut -d'#' -f1)
+    local flow=$(echo "$params" | grep '^flow=' | cut -d= -f2 | cut -d'#' -f1)
+    local type=$(echo "$params" | grep '^type=' | cut -d= -f2 | cut -d'#' -f1)
+
+    [ -z "$sni" ] && sni="$host"
+    [ -z "$fp" ] && fp="chrome"
+    [ -z "$port" ] && port="443"
+
+    # TUN address - use unique subnet
+    local tun_num=$(printf '%s' "$IFACE" | awk 'BEGIN{s=0}{for(i=1;i<=length($0);i++){c=substr($0,i,1);s+=index("abcdefghijklmnopqrstuvwxyz0123456789_",c)}}END{print (s%200)+50}')
+    [ -z "$tun_num" ] || [ "$tun_num" -eq 0 ] 2>/dev/null && tun_num=50
+    local tun_addr="172.19.${tun_num}.1/30"
+
+    # Generate unique Clash API port (9091-9190)
+    local clash_port=9091
+    if [ -f "$EXITNODES_FILE" ]; then
+        local used_ports=$(grep -o '"clash_port":[0-9]*' "$EXITNODES_FILE" | cut -d: -f2 | sort -n)
+        while echo "$used_ports" | grep -q "^${clash_port}$"; do
+            clash_port=$((clash_port + 1))
+        done
+    fi
+
+    # Build sing-box config
+    local tls_block=""
+    if [ "$security" = "reality" ]; then
+        tls_block=$(printf '{"enabled":true,"server_name":"%s","utls":{"enabled":true,"fingerprint":"%s"},"reality":{"enabled":true,"public_key":"%s","short_id":"%s"}}' \
+            "$sni" "$fp" "$pbk" "${sid:-}")
+    elif [ "$security" = "tls" ]; then
+        tls_block=$(printf '{"enabled":true,"server_name":"%s","utls":{"enabled":true,"fingerprint":"%s"}}' "$sni" "$fp")
+    else
+        tls_block='{"enabled":false}'
+    fi
+
+    local flow_line=""
+    [ -n "$flow" ] && flow_line="\"flow\":\"$flow\","
+
+    cat > "$SINGBOX_CONF_DIR/${IFACE}.json" << EOF
+{
+  "log": {"level": "warn", "output": "/var/log/singbox-${IFACE}.log"},
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:${clash_port}"
+    }
+  },
+  "inbounds": [{
+    "type": "tun",
+    "tag": "tun-in",
+    "interface_name": "$IFACE",
+    "address": ["$tun_addr"],
+    "auto_route": false,
+    "strict_route": false,
+    "stack": "gvisor"
+  }],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "proxy-out",
+      "server": "$host",
+      "server_port": $port,
+      "uuid": "$uuid",
+      ${flow_line}
+      "tls": $tls_block
+    },
+    {"type": "direct", "tag": "direct"}
+  ],
+  "route": {"rules": [], "final": "proxy-out"}
+}
+EOF
+
+    # Do NOT create UCI network interface for singbox - sing-box manages TUN directly
+    # Just remove any leftover UCI entry
+    uci delete network.$IFACE 2>/dev/null
+    uci commit network
+
+    # NOTE: TUN interfaces cannot be added to UCI firewall WAN zone without a network entry
+    # nft rules are added directly in service_started() of the init.d script instead
+
+    # Create init.d service
+    cat > "/etc/init.d/singbox-$IFACE" << EOF2
+#!/bin/sh /etc/rc.common
+START=95
+STOP=15
+
+PIDFILE="/var/run/singbox-${IFACE}.pid"
+
+start() {
+    [ -f "\$PIDFILE" ] && kill -0 \$(cat "\$PIDFILE") 2>/dev/null && return 0
+    /usr/bin/sing-box run -c $SINGBOX_CONF_DIR/${IFACE}.json &
+    echo \$! > "\$PIDFILE"
+    # Wait for interface and apply rules
+    local i=0
+    while [ \$i -lt 15 ]; do
+        ip link show "$IFACE" > /dev/null 2>&1 && break
+        sleep 1
+        i=\$((i+1))
+    done
+    # nft forward rules
+    nft list chains inet 2>/dev/null | grep "forward_" | awk '{print \$2}' | while read chain; do
+        nft -a list chain inet fw4 "\$chain" 2>/dev/null | grep -q "oifname \"$IFACE\"" || \
+            nft add rule inet fw4 "\$chain" oifname "$IFACE" accept 2>/dev/null
+    done
+    nft -a list chain inet fw4 accept_to_wan 2>/dev/null | grep -q "oifname \"$IFACE\"" || \
+        nft add rule inet fw4 accept_to_wan oifname "$IFACE" accept 2>/dev/null
+    /usr/bin/awg-routing apply
+}
+
+stop() {
+    [ -f "\$PIDFILE" ] && kill \$(cat "\$PIDFILE") 2>/dev/null && rm -f "\$PIDFILE"
+    # Remove nft rules
+    for chain in accept_to_wan \$(nft list chains inet 2>/dev/null | grep "forward_" | awk '{print \$2}'); do
+        handles=\$(nft -a list chain inet fw4 "\$chain" 2>/dev/null | grep "oifname \"$IFACE\"" | grep -o 'handle [0-9]*' | awk '{print \$2}')
+        for h in \$handles; do
+            nft delete rule inet fw4 "\$chain" handle \$h 2>/dev/null
+        done
+    done
+}
+EOF2
+    chmod +x "/etc/init.d/singbox-$IFACE"
+    "/etc/init.d/singbox-$IFACE" enable 2>/dev/null
+
+    # Register in exitnodes
+    local json=$(cat "$EXITNODES_FILE")
+    json=$(echo "$json" | sed "s/,\"$IFACE\":{[^}]*}//g;s/\"$IFACE\":{[^}]*},\?//g;s/,,/,/g;s/{,/{/g;s/,}/}/g")
+    local entry=$(printf '{"type":"singbox","protocol":"vless","display_name":"%s","tun_addr":"%s","server":"%s","clash_port":%s}' \
+        "$DISPLAY" "$(echo $tun_addr | cut -d/ -f1)" "$host" "$clash_port")
+    local new=$(echo "$json" | sed "s/}$/,\"$IFACE\":$entry}/;s/^{,/{/")
+    echo "$new" > "$EXITNODES_FILE"
+
+    # Start service in background - it will apply nft rules and routing when interface is up
+    "/etc/init.d/singbox-$IFACE" start > /dev/null 2>&1 &
+
+    echo 'ok'
+}
+
+delete_exitnode() {
+    local IFACE=$1
+    [ -z "$IFACE" ] && exit 1
+    init_exitnodes
+
+    local node_type=$(grep -o "\"$IFACE\":{\"type\":\"[^\"]*\"" "$EXITNODES_FILE" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
+
+    if [ "$node_type" = "singbox" ]; then
+        [ -f "/etc/init.d/singbox-$IFACE" ] && {
+            "/etc/init.d/singbox-$IFACE" stop 2>/dev/null
+            "/etc/init.d/singbox-$IFACE" disable 2>/dev/null
+            rm -f "/etc/init.d/singbox-$IFACE"
+        }
+        rm -f "$SINGBOX_CONF_DIR/${IFACE}.json"
+        # Remove nft rules for this interface
+        for chain in $(nft list chains 2>/dev/null | grep "chain " | awk '{print $2}'); do
+            handles=$(nft -a list chain inet fw4 "$chain" 2>/dev/null | grep "oifname \"$IFACE\"" | grep -o 'handle [0-9]*' | awk '{print $2}')
+            for h in $handles; do
+                nft delete rule inet fw4 "$chain" handle $h 2>/dev/null
+            done
+        done
+    fi
+
+    if [ "$node_type" = "awg" ] || [ "$node_type" = "singbox" ]; then
+        # Remove UCI interface and peer
+        uci delete network.${IFACE}_peer_exit 2>/dev/null
+        uci delete network.$IFACE 2>/dev/null
+        uci commit network
+        # Remove from WAN zone
+        local idx=0
+        while uci get firewall.@zone[$idx] > /dev/null 2>&1; do
+            if [ "$(uci get firewall.@zone[$idx].name 2>/dev/null)" = "wan" ]; then
+                local nets=$(uci get firewall.@zone[$idx].network 2>/dev/null)
+                nets=$(echo "$nets" | tr ' ' '\n' | grep -v "^$IFACE$" | tr '\n' ' ' | sed 's/ $//')
+                uci set firewall.@zone[$idx].network="$nets"
+                uci commit firewall
+                break
+            fi
+            idx=$((idx+1))
+        done
+    fi
+
+    clean_routing_for_server "$IFACE"
+    clean_healthcheck_for_node "$IFACE"
+    /usr/bin/awg-routing delete "$IFACE"
+
+    local json=$(cat "$EXITNODES_FILE")
+    json=$(echo "$json" | sed "s/,\"$IFACE\":{[^}]*}//g;s/\"$IFACE\":{[^}]*},\?//g;s/,,/,/g;s/{,/{/g;s/,}/}/g")
+    echo "$json" > "$EXITNODES_FILE"
+
+    /usr/bin/awg-routing apply
+    echo 'ok'
+}
+
 # ─── DISPATCH ───────────────────────────────────────────────
 case $1 in
     list_servers)     list_servers ;;
@@ -606,8 +1221,6 @@ case $1 in
     add_client)       add_client "$2" "$3" "$4" ;;
     delete_client)    delete_client "$2" "$3" ;;
     peers_stats)      peers_stats "$2" ;;
-    accumulate_stats) accumulate_stats "$2" ;;
-    monthly_stats)    monthly_stats "$2" ;;
     enable_client)
         PEER_ID="${2}_peer_$(echo $3 | tr -cd 'a-zA-Z0-9_')"
         uci delete network.$PEER_ID.disabled 2>/dev/null
@@ -625,9 +1238,28 @@ case $1 in
     get_routing)      get_routing ;;
     save_routing)     save_routing "$2" ;;
     get_healthcheck)  get_healthcheck ;;
+    get_hc_config)    get_hc_config ;;
+    save_hc_config)   save_hc_config "$2" ;;
+    get_hc_logs)      get_hc_logs ;;
+    get_hc_singbox_config)  get_hc_singbox_config ;;
+    save_hc_singbox_config) save_hc_singbox_config "$2" ;;
+    get_hc_logs_singbox)    get_hc_logs_singbox ;;
     get_interfaces)   get_interfaces ;;
+    ip_full_check)
+        # Test multipath support - ip-full supports nexthop keyword
+        ip route add blackhole 192.0.2.0/24 table 199 2>/dev/null
+        result=$(ip route add blackhole 192.0.2.1/32 table 199 nexthop dev lo 2>&1)
+        ip route flush table 199 2>/dev/null
+        echo "$result" | grep -q "garbage\|invalid\|error" && echo "not_installed" || echo "installed"
+        ;;
+    get_exitnodes)        get_exitnodes ;;
+    create_awg_exitnode)  create_awg_exitnode "$2" "$3" "$4" ;;
+    create_singbox_exitnode) create_singbox_exitnode "$2" "$3" "$4" ;;
+    delete_exitnode)      delete_exitnode "$2" ;;
     get_lists)        get_lists ;;
     save_list)        save_list "$2" "$3" ;;
     delete_list)      delete_list "$2" ;;
+    get_diagnostics)  get_diagnostics "$2" ;;
+    run_healthcheck)  /usr/bin/awg-healthcheck ;;
     *) echo "Usage: $0 <command> [args]" ;;
 esac
